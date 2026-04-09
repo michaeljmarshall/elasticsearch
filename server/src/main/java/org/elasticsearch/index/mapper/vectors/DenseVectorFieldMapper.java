@@ -30,8 +30,6 @@ import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.VectorEncoding;
 import org.apache.lucene.index.VectorSimilarityFunction;
-import org.apache.lucene.search.BooleanClause;
-import org.apache.lucene.search.BooleanQuery;
 import org.apache.lucene.search.FieldExistsQuery;
 import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
@@ -86,7 +84,6 @@ import org.elasticsearch.search.aggregations.support.CoreValuesSourceType;
 import org.elasticsearch.search.lookup.Source;
 import org.elasticsearch.search.vectors.DenseVectorQuery;
 import org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatVectorQuery;
-import org.elasticsearch.search.vectors.DiversifyingParentBlockQuery;
 import org.elasticsearch.search.vectors.ESDiversifyingChildrenByteKnnVectorQuery;
 import org.elasticsearch.search.vectors.ESDiversifyingChildrenFloatKnnVectorQuery;
 import org.elasticsearch.search.vectors.ESKnnByteVectorQuery;
@@ -3050,30 +3047,18 @@ public class DenseVectorFieldMapper extends FieldMapper {
             boolean hnswEarlyTermination
         ) {
             element.checkDimensions(dims, queryVector.length);
-            Query knnQuery;
-            if (indexOptions != null && indexOptions.isFlat()) {
-                var exactKnnQuery = parentFilter != null
-                    ? new DiversifyingParentBlockQuery(parentFilter, createExactKnnBitQuery(queryVector))
-                    : createExactKnnBitQuery(queryVector);
-                knnQuery = filter == null
-                    ? exactKnnQuery
-                    : new BooleanQuery.Builder().add(exactKnnQuery, BooleanClause.Occur.SHOULD)
-                        .add(filter, BooleanClause.Occur.FILTER)
-                        .build();
-            } else {
-                knnQuery = parentFilter != null
-                    ? new ESDiversifyingChildrenByteKnnVectorQuery(
-                        name(),
-                        queryVector,
-                        filter,
-                        k,
-                        numCands,
-                        parentFilter,
-                        searchStrategy,
-                        hnswEarlyTermination
-                    )
-                    : new ESKnnByteVectorQuery(name(), queryVector, k, numCands, filter, searchStrategy, hnswEarlyTermination);
-            }
+            Query knnQuery = parentFilter != null
+                ? new ESDiversifyingChildrenByteKnnVectorQuery(
+                    name(),
+                    queryVector,
+                    filter,
+                    k,
+                    numCands,
+                    parentFilter,
+                    searchStrategy,
+                    hnswEarlyTermination
+                )
+                : new ESKnnByteVectorQuery(name(), queryVector, k, numCands, filter, searchStrategy, hnswEarlyTermination);
             if (similarityThreshold != null) {
                 knnQuery = new VectorSimilarityQuery(
                     knnQuery,
@@ -3100,30 +3085,18 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 float squaredMagnitude = ESVectorUtil.dotProduct(queryVector, queryVector);
                 element.checkVectorMagnitude(similarity, ByteElement.errorElementsAppender(queryVector), squaredMagnitude);
             }
-            Query knnQuery;
-            if (indexOptions != null && indexOptions.isFlat()) {
-                var exactKnnQuery = parentFilter != null
-                    ? new DiversifyingParentBlockQuery(parentFilter, createExactKnnByteQuery(queryVector))
-                    : createExactKnnByteQuery(queryVector);
-                knnQuery = filter == null
-                    ? exactKnnQuery
-                    : new BooleanQuery.Builder().add(exactKnnQuery, BooleanClause.Occur.SHOULD)
-                        .add(filter, BooleanClause.Occur.FILTER)
-                        .build();
-            } else {
-                knnQuery = parentFilter != null
-                    ? new ESDiversifyingChildrenByteKnnVectorQuery(
-                        name(),
-                        queryVector,
-                        filter,
-                        k,
-                        numCands,
-                        parentFilter,
-                        searchStrategy,
-                        hnswEarlyTermination
-                    )
-                    : new ESKnnByteVectorQuery(name(), queryVector, k, numCands, filter, searchStrategy, hnswEarlyTermination);
-            }
+            Query knnQuery = parentFilter != null
+                ? new ESDiversifyingChildrenByteKnnVectorQuery(
+                    name(),
+                    queryVector,
+                    filter,
+                    k,
+                    numCands,
+                    parentFilter,
+                    searchStrategy,
+                    hnswEarlyTermination
+                )
+                : new ESKnnByteVectorQuery(name(), queryVector, k, numCands, filter, searchStrategy, hnswEarlyTermination);
             if (similarityThreshold != null) {
                 knnQuery = new VectorSimilarityQuery(
                     knnQuery,
@@ -3176,16 +3149,7 @@ public class DenseVectorFieldMapper extends FieldMapper {
                 numCands = Math.max(adjustedK, numCands);
             }
             Query knnQuery;
-            if (indexOptions != null && indexOptions.isFlat()) {
-                var exactKnnQuery = parentFilter != null
-                    ? new DiversifyingParentBlockQuery(parentFilter, createExactKnnFloatQuery(queryVector))
-                    : createExactKnnFloatQuery(queryVector);
-                knnQuery = filter == null
-                    ? exactKnnQuery
-                    : new BooleanQuery.Builder().add(exactKnnQuery, BooleanClause.Occur.SHOULD)
-                        .add(filter, BooleanClause.Occur.FILTER)
-                        .build();
-            } else if (indexOptions instanceof BBQIVFIndexOptions bbqIndexOptions) {
+            if (indexOptions instanceof BBQIVFIndexOptions bbqIndexOptions) {
                 float defaultVisitRatio = (float) (bbqIndexOptions.defaultVisitPercentage / 100d);
                 float visitRatio = visitPercentage == null ? defaultVisitRatio : (float) (visitPercentage / 100d);
                 knnQuery = parentFilter != null

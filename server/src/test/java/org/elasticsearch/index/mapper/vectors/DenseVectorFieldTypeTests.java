@@ -25,7 +25,6 @@ import org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper.VectorSimil
 import org.elasticsearch.search.DocValueFormat;
 import org.elasticsearch.search.vectors.DenseVectorQuery;
 import org.elasticsearch.search.vectors.DiversifyingChildrenIVFKnnFloatVectorQuery;
-import org.elasticsearch.search.vectors.DiversifyingParentBlockQuery;
 import org.elasticsearch.search.vectors.ESKnnByteVectorQuery;
 import org.elasticsearch.search.vectors.ESKnnFloatVectorQuery;
 import org.elasticsearch.search.vectors.IVFKnnFloatVectorQuery;
@@ -341,13 +340,9 @@ public class DenseVectorFieldTypeTests extends FieldTypeTestCase {
             if (query instanceof RescoreKnnVectorQuery rescoreKnnVectorQuery) {
                 query = rescoreKnnVectorQuery.innerQuery();
             }
-            if (field.getIndexOptions().isFlat()) {
-                assertThat(query, instanceOf(DiversifyingParentBlockQuery.class));
-            } else {
-                assertTrue(
-                    query instanceof DiversifyingChildrenFloatKnnVectorQuery || query instanceof DiversifyingChildrenIVFKnnFloatVectorQuery
-                );
-            }
+            assertTrue(
+                query instanceof DiversifyingChildrenFloatKnnVectorQuery || query instanceof DiversifyingChildrenIVFKnnFloatVectorQuery
+            );
         }
         {
             DenseVectorFieldType field = new DenseVectorFieldType(
@@ -380,11 +375,7 @@ public class DenseVectorFieldTypeTests extends FieldTypeTestCase {
                 randomFrom(DenseVectorFieldMapper.FilterHeuristic.values()),
                 randomBoolean()
             );
-            if (field.getIndexOptions().isFlat()) {
-                assertThat(query, instanceOf(DiversifyingParentBlockQuery.class));
-            } else {
-                assertTrue(query instanceof DiversifyingChildrenByteKnnVectorQuery);
-            }
+            assertTrue(query instanceof DiversifyingChildrenByteKnnVectorQuery);
 
             vectorData = VectorData.fromFloats(floatQueryVector);
             query = field.createKnnQuery(
@@ -399,11 +390,7 @@ public class DenseVectorFieldTypeTests extends FieldTypeTestCase {
                 randomFrom(DenseVectorFieldMapper.FilterHeuristic.values()),
                 randomBoolean()
             );
-            if (field.getIndexOptions().isFlat()) {
-                assertThat(query, instanceOf(DiversifyingParentBlockQuery.class));
-            } else {
-                assertTrue(query instanceof DiversifyingChildrenByteKnnVectorQuery);
-            }
+            assertTrue(query instanceof DiversifyingChildrenByteKnnVectorQuery);
         }
     }
 
@@ -574,11 +561,7 @@ public class DenseVectorFieldTypeTests extends FieldTypeTestCase {
             if (query instanceof RescoreKnnVectorQuery rescoreKnnVectorQuery) {
                 query = rescoreKnnVectorQuery.innerQuery();
             }
-            if (fieldWith4096dims.getIndexOptions().isFlat()) {
-                assertThat(query, instanceOf(DenseVectorQuery.Floats.class));
-            } else {
-                assertTrue(query instanceof KnnFloatVectorQuery || query instanceof IVFKnnFloatVectorQuery);
-            }
+            assertTrue(query instanceof KnnFloatVectorQuery || query instanceof IVFKnnFloatVectorQuery);
         }
 
         {   // byte type with 4096 dims
@@ -610,11 +593,7 @@ public class DenseVectorFieldTypeTests extends FieldTypeTestCase {
                 randomFrom(DenseVectorFieldMapper.FilterHeuristic.values()),
                 randomBoolean()
             );
-            if (fieldWith4096dims.getIndexOptions().isFlat()) {
-                assertThat(query, instanceOf(DenseVectorQuery.Bytes.class));
-            } else {
-                assertTrue(query instanceof ESKnnByteVectorQuery);
-            }
+            assertTrue(query instanceof ESKnnByteVectorQuery);
         }
     }
 
@@ -721,21 +700,13 @@ public class DenseVectorFieldTypeTests extends FieldTypeTestCase {
         );
 
         if (elementType == BYTE) {
-            if (nonQuantizedField.getIndexOptions().isFlat()) {
-                assertThat(knnQuery, instanceOf(DenseVectorQuery.Bytes.class));
-            } else {
-                ESKnnByteVectorQuery knnByteVectorQuery = (ESKnnByteVectorQuery) knnQuery;
-                assertThat(knnByteVectorQuery.getK(), is(100));
-                assertThat(knnByteVectorQuery.kParam(), is(10));
-            }
+            ESKnnByteVectorQuery knnByteVectorQuery = (ESKnnByteVectorQuery) knnQuery;
+            assertThat(knnByteVectorQuery.getK(), is(100));
+            assertThat(knnByteVectorQuery.kParam(), is(10));
         } else {
-            if (nonQuantizedField.getIndexOptions().isFlat()) {
-                assertThat(knnQuery, instanceOf(DenseVectorQuery.Floats.class));
-            } else {
-                ESKnnFloatVectorQuery knnFloatVectorQuery = (ESKnnFloatVectorQuery) knnQuery;
-                assertThat(knnFloatVectorQuery.getK(), is(100));
-                assertThat(knnFloatVectorQuery.kParam(), is(10));
-            }
+            ESKnnFloatVectorQuery knnFloatVectorQuery = (ESKnnFloatVectorQuery) knnQuery;
+            assertThat(knnFloatVectorQuery.getK(), is(100));
+            assertThat(knnFloatVectorQuery.kParam(), is(10));
         }
     }
 

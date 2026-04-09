@@ -266,26 +266,22 @@ abstract class AbstractKnnVectorQueryBuilderTestCase extends AbstractQueryTestCa
         };
 
         Query bruteForceVectorQueryBuilt = switch (elementType()) {
-            case BIT, BYTE -> {
-                if (filterQuery != null) {
-                    yield new BooleanQuery.Builder().add(
-                        new DenseVectorQuery.Bytes(resolvedVector.asByteVector(), VECTOR_FIELD),
-                        BooleanClause.Occur.SHOULD
-                    ).add(filterQuery, BooleanClause.Occur.FILTER).build();
-                } else {
-                    yield new DenseVectorQuery.Bytes(resolvedVector.asByteVector(), VECTOR_FIELD);
-                }
-            }
-            case FLOAT, BFLOAT16 -> {
-                if (filterQuery != null) {
-                    yield new BooleanQuery.Builder().add(
-                        new DenseVectorQuery.Floats(resolvedVector.asFloatVector(), VECTOR_FIELD),
-                        BooleanClause.Occur.SHOULD
-                    ).add(filterQuery, BooleanClause.Occur.FILTER).build();
-                } else {
-                    yield new DenseVectorQuery.Floats(resolvedVector.asFloatVector(), VECTOR_FIELD);
-                }
-            }
+            case BYTE, BIT -> new ESKnnByteVectorQuery(
+                VECTOR_FIELD,
+                resolvedVector.asByteVector(),
+                k,
+                numCands,
+                filterQuery,
+                expectedStrategy
+            );
+            case FLOAT, BFLOAT16 -> new ESKnnFloatVectorQuery(
+                VECTOR_FIELD,
+                resolvedVector.asFloatVector(),
+                k,
+                numCands,
+                filterQuery,
+                expectedStrategy
+            );
         };
 
         if (query instanceof VectorSimilarityQuery vectorSimilarityQuery) {
