@@ -84,8 +84,8 @@ public class BulkNeighborQueueTests extends ESTestCase {
 
     public void testMinCompetitiveDocScoreAtLongMinValueHandledCorrectly() {
         BulkNeighborQueue queue = BulkNeighborQueue.forMerging(1);
-        queue.insertWithOverflowBulk(new int[]{5}, new float[]{0.0f}, 1, 0.0f, Long.MIN_VALUE);
-        queue.insertWithOverflowBulk(new int[]{6}, new float[]{1.0f}, 1, 1.0f, Long.MIN_VALUE);
+        queue.insertWithOverflowBulk(new int[] { 5 }, new float[] { 0.0f }, 1, 0.0f, Long.MIN_VALUE);
+        queue.insertWithOverflowBulk(new int[] { 6 }, new float[] { 1.0f }, 1, 1.0f, Long.MIN_VALUE);
 
         List<Long> drained = drainEncoded(queue);
         assertEquals(1, drained.size());
