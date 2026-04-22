@@ -682,6 +682,7 @@ public class KnnIndexTester {
                 "avg_cpu_count",
                 "QPS",
                 "recall",
+                "top_k",
                 "visited",
                 "filter_selectivity",
                 "filter_cached",
@@ -725,6 +726,7 @@ public class KnnIndexTester {
                     String.format(Locale.ROOT, "%.2f", queryResult.avgCpuCount),
                     String.format(Locale.ROOT, "%.2f", queryResult.qps),
                     String.format(Locale.ROOT, "%.2f", queryResult.avgRecall),
+                    String.format(Locale.ROOT, "%d", queryResult.topK),
                     String.format(Locale.ROOT, "%.2f", queryResult.averageVisited),
                     String.format(Locale.ROOT, "%.2f", queryResult.filterSelectivity),
                     Boolean.toString(queryResult.filterCached),
@@ -829,6 +831,7 @@ public class KnnIndexTester {
         double overSamplingFactor;
         boolean earlyTermination;
         int numCandidates;
+        int topK;
         Map<String, Float> perPartitionRecall;
 
         Results(String indexName, String indexType, int numDocs) {
