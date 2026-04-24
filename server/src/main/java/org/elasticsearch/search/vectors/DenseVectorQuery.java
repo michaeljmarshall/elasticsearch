@@ -71,11 +71,9 @@ public abstract class DenseVectorQuery extends Query {
     @Override
     public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
         if (filter != null && filter.getClass() != MatchAllDocsQuery.class) {
-            BooleanQuery booleanQuery =
-                new BooleanQuery.Builder()
-                    .add(filter, BooleanClause.Occur.FILTER)
-                    .add(new FieldExistsQuery(field), BooleanClause.Occur.FILTER)
-                    .build();
+            BooleanQuery booleanQuery = new BooleanQuery.Builder().add(filter, BooleanClause.Occur.FILTER)
+                .add(new FieldExistsQuery(field), BooleanClause.Occur.FILTER)
+                .build();
             Query rewritten = searcher.rewrite(booleanQuery);
             return rewritten.createWeight(searcher, ScoreMode.COMPLETE_NO_SCORES, 1f);
         } else {
@@ -195,8 +193,7 @@ public abstract class DenseVectorQuery extends Query {
 
         @Override
         public Query rewrite(IndexSearcher indexSearcher) throws IOException {
-            if (filter == null)
-                return this;
+            if (filter == null) return this;
             Query rewritten = indexSearcher.rewrite(filter);
             if (rewritten == filter) {
                 return this;
@@ -252,8 +249,7 @@ public abstract class DenseVectorQuery extends Query {
 
         @Override
         public Query rewrite(IndexSearcher indexSearcher) throws IOException {
-            if (filter == null)
-                return this;
+            if (filter == null) return this;
             Query rewritten = indexSearcher.rewrite(filter);
             if (rewritten.getClass() == MatchNoDocsQuery.class) {
                 return rewritten;
