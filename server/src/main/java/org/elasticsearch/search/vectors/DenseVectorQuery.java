@@ -21,7 +21,6 @@ import org.apache.lucene.search.DocAndFloatFeatureBuffer;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
 import org.apache.lucene.search.FieldExistsQuery;
-import org.apache.lucene.search.FilteredDocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.LeafCollector;
 import org.apache.lucene.search.MatchAllDocsQuery;
@@ -100,25 +99,20 @@ public abstract class DenseVectorQuery extends Query {
         abstract VectorScorer vectorScorer(LeafReaderContext leafReaderContext) throws IOException;
 
         /**
-         * Builds an {@link AcceptDocs} for the given leaf, combining any filter weight with live
-         * docs. Returns {@code null} when the filter matches no documents in this leaf (the leaf
-         * should be skipped entirely). The returned instance is guaranteed never to have
-         * {@link AcceptDocs#bits()} or {@link AcceptDocs#cost()} called on it, keeping
-         * filter evaluation fully lazy.
+         * Builds an {@link AcceptDocs} for the given leaf. Returns {@code null} when the
+         * filter matches no documents in this leaf (the leaf should be skipped entirely).
+         * The returned instance is guaranteed never to have {@link AcceptDocs#bits()} or
+         * {@link AcceptDocs#cost()} called on it, keeping filter evaluation fully lazy.
          */
         private AcceptDocs buildAcceptDocs(LeafReaderContext context) throws IOException {
-            Bits liveDocs = context.reader().getLiveDocs();
             if (filterWeight == null) {
-                if (liveDocs == null) {
-                    return ESAcceptDocs.ESAcceptDocsAll.INSTANCE;
-                }
-                return new ESAcceptDocs.BitsAcceptDocs(liveDocs, context.reader().maxDoc());
+                return ESAcceptDocs.ESAcceptDocsAll.INSTANCE;
             }
             ScorerSupplier filterSupplier = filterWeight.scorerSupplier(context);
             if (filterSupplier == null) {
                 return null;
             }
-            return new LazyIteratorAcceptDocs(filterSupplier, liveDocs);
+            return new LazyIteratorAcceptDocs(filterSupplier);
         }
 
         @Override
@@ -387,11 +381,9 @@ public abstract class DenseVectorQuery extends Query {
      */
     static final class LazyIteratorAcceptDocs extends AcceptDocs {
         private final ScorerSupplier scorerSupplier;
-        private final Bits liveDocs;
 
-        LazyIteratorAcceptDocs(ScorerSupplier scorerSupplier, Bits liveDocs) {
+        LazyIteratorAcceptDocs(ScorerSupplier scorerSupplier) {
             this.scorerSupplier = scorerSupplier;
-            this.liveDocs = liveDocs;
         }
 
         @Override
@@ -401,16 +393,7 @@ public abstract class DenseVectorQuery extends Query {
 
         @Override
         public DocIdSetIterator iterator() throws IOException {
-            DocIdSetIterator filterIterator = scorerSupplier.get(Long.MAX_VALUE).iterator();
-            if (liveDocs == null) {
-                return filterIterator;
-            }
-            return new FilteredDocIdSetIterator(filterIterator) {
-                @Override
-                protected boolean match(int doc) {
-                    return liveDocs.get(doc);
-                }
-            };
+            return scorerSupplier.get(Long.MAX_VALUE).iterator();
         }
 
         @Override
