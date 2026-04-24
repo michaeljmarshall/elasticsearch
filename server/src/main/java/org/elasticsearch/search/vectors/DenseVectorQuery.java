@@ -354,6 +354,7 @@ public abstract class DenseVectorQuery extends Query {
                 }
                 for (int i = 0; i < buffer.size; i++) {
                     int doc = buffer.docs[i];
+                    // TODO implement bulkScorer.advance?
                     if (doc >= min) {
                         // currentScore is closed over by scorable
                         currentScore = buffer.features[i] * boost;
@@ -361,7 +362,9 @@ public abstract class DenseVectorQuery extends Query {
                     }
                 }
             }
-            return DocIdSetIterator.NO_MORE_DOCS;
+
+            // We pass max into nextDocsAndScores, so max is the minimum possible next value.
+            return max;
         }
 
         @Override
