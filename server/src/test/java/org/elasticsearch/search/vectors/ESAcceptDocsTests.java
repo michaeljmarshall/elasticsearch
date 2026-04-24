@@ -97,6 +97,48 @@ public class ESAcceptDocsTests extends ESTestCase {
         }
     }
 
+    public void testLazyIteratorAcceptDocs() throws IOException {
+        int[] docIds = new int[] { 1, 3, 5, 7, 9 };
+        BitSet bitSet = new FixedBitSet(10);
+        for (int docId : docIds) {
+            bitSet.set(docId);
+        }
+        // basic iteration, no live docs
+        {
+            DocIdSetIterator iterator = new BitSetIterator(bitSet, bitSet.cardinality());
+            DenseVectorQuery.LazyIteratorAcceptDocs acceptDocs = new DenseVectorQuery.LazyIteratorAcceptDocs(
+                new TestScorerSupplier(iterator),
+                null
+            );
+            expectThrows(UnsupportedOperationException.class, () -> acceptDocs.cost());
+            expectThrows(UnsupportedOperationException.class, () -> acceptDocs.bits());
+            DocIdSetIterator acceptDocsIterator = acceptDocs.iterator();
+            for (int docId : docIds) {
+                assertEquals(docId, acceptDocsIterator.nextDoc());
+            }
+            assertEquals(DocIdSetIterator.NO_MORE_DOCS, acceptDocsIterator.nextDoc());
+        }
+        // iteration with live docs — deleted docs must be excluded
+        {
+            DocIdSetIterator iterator = new BitSetIterator(bitSet, bitSet.cardinality());
+            FixedBitSet liveDocs = new FixedBitSet(10);
+            liveDocs.set(0, 10);
+            liveDocs.clear(1);
+            liveDocs.clear(3);
+            liveDocs.clear(9);
+            DenseVectorQuery.LazyIteratorAcceptDocs acceptDocs = new DenseVectorQuery.LazyIteratorAcceptDocs(
+                new TestScorerSupplier(iterator),
+                liveDocs
+            );
+            expectThrows(UnsupportedOperationException.class, () -> acceptDocs.cost());
+            expectThrows(UnsupportedOperationException.class, () -> acceptDocs.bits());
+            DocIdSetIterator acceptDocsIterator = acceptDocs.iterator();
+            assertEquals(5, acceptDocsIterator.nextDoc());
+            assertEquals(7, acceptDocsIterator.nextDoc());
+            assertEquals(DocIdSetIterator.NO_MORE_DOCS, acceptDocsIterator.nextDoc());
+        }
+    }
+
     private static class TestScorerSupplier extends ScorerSupplier {
         private final DocIdSetIterator iterator;
 

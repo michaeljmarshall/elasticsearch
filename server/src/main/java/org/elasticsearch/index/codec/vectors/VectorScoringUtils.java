@@ -16,6 +16,7 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.util.hnsw.RandomVectorScorer;
+import org.elasticsearch.search.vectors.BulkKnnCollector;
 
 import java.io.IOException;
 
@@ -107,10 +108,14 @@ public final class VectorScoringUtils {
                 continue;
             }
 
-            for (int i = 0; i < buffer.size; i++) {
-                float score = buffer.features[i];
-                int doc = buffer.docs[i];
-                knnCollector.collect(doc, score);
+            if (knnCollector instanceof BulkKnnCollector bulkKnnCollector) {
+                bulkKnnCollector.bulkCollect(buffer.docs, buffer.features, buffer.size, maxScore);
+            } else {
+                for (int i = 0; i < buffer.size; i++) {
+                    float score = buffer.features[i];
+                    int doc = buffer.docs[i];
+                    knnCollector.collect(doc, score);
+                }
             }
         }
         assert knnCollector.earlyTerminated() == false;

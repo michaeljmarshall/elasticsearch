@@ -16,7 +16,7 @@ import org.apache.lucene.index.VectorSimilarityFunction;
 public class DenseVectorQueryFloatsTests extends AbstractDenseVectorQueryTestCase {
     @Override
     DenseVectorQuery getDenseVectorQuery(String field, float[] query) {
-        return new DenseVectorQuery.Floats(query, field);
+        return new DenseVectorQuery.Floats(query, field, null);
     }
 
     @Override

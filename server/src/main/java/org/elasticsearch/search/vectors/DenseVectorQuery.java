@@ -12,30 +12,56 @@ package org.elasticsearch.search.vectors;
 import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.LeafReaderContext;
+import org.apache.lucene.search.AcceptDocs;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.BulkScorer;
+import org.apache.lucene.search.ConjunctionUtils;
+import org.apache.lucene.search.DocAndFloatFeatureBuffer;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Explanation;
+import org.apache.lucene.search.FieldExistsQuery;
+import org.apache.lucene.search.FilteredDocIdSetIterator;
 import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.LeafCollector;
+import org.apache.lucene.search.MatchAllDocsQuery;
+import org.apache.lucene.search.MatchNoDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.QueryVisitor;
+import org.apache.lucene.search.Scorable;
 import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.Scorer;
 import org.apache.lucene.search.ScorerSupplier;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.search.Weight;
+import org.apache.lucene.util.Bits;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 /**
- * Exact knn query. Will iterate and score all documents that have the provided dense vector field in the index.
+ * Exact knn query. Will iterate and score all documents that have the provided dense vector field in
+ * the index. An optional filter restricts scoring to documents that also match that query.
+ *
+ * <p>Scoring uses two complementary bulk paths:
+ * <ul>
+ *   <li>{@link ScorerSupplier#bulkScorer()} returns a {@link BulkScorer} backed by
+ *       {@link VectorScorer#bulk} for the top-level collection path, letting the similarity
+ *       computation run in SIMD-friendly batches without per-document dispatch overhead.</li>
+ *   <li>{@link ScorerSupplier#get(long)} returns a standard {@link Scorer} for the
+ *       explain and conjunction paths where per-document scoring is required.</li>
+ * </ul>
  */
 public abstract class DenseVectorQuery extends Query {
 
     protected final String field;
+    protected final Query filter;
 
-    public DenseVectorQuery(String field) {
+    public DenseVectorQuery(String field, Query filter) {
         this.field = field;
+        this.filter = filter;
     }
 
     @Override
@@ -43,20 +69,66 @@ public abstract class DenseVectorQuery extends Query {
         queryVisitor.visitLeaf(this);
     }
 
+    @Override
+    public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
+        if (filter != null && filter.getClass() != MatchAllDocsQuery.class) {
+            BooleanQuery booleanQuery =
+                new BooleanQuery.Builder()
+                    .add(filter, BooleanClause.Occur.FILTER)
+                    .add(new FieldExistsQuery(field), BooleanClause.Occur.FILTER)
+                    .build();
+            Query rewritten = searcher.rewrite(booleanQuery);
+            return rewritten.createWeight(searcher, ScoreMode.COMPLETE_NO_SCORES, 1f);
+        } else {
+            // If the filter is a match all docs query, we can skip it
+            return null;
+        }
+    }
+
     abstract static class DenseVectorWeight extends Weight {
         private final String field;
         private final float boost;
+        private final Weight filterWeight;
 
-        protected DenseVectorWeight(DenseVectorQuery query, float boost) {
+        protected DenseVectorWeight(DenseVectorQuery query, float boost, Weight filterWeight) {
             super(query);
             this.field = query.field;
             this.boost = boost;
+            this.filterWeight = filterWeight;
         }
 
         abstract VectorScorer vectorScorer(LeafReaderContext leafReaderContext) throws IOException;
 
+        /**
+         * Builds an {@link AcceptDocs} for the given leaf, combining any filter weight with live
+         * docs. Returns {@code null} when the filter matches no documents in this leaf (the leaf
+         * should be skipped entirely). The returned instance is guaranteed never to have
+         * {@link AcceptDocs#bits()} or {@link AcceptDocs#cost()} called on it, keeping
+         * filter evaluation fully lazy.
+         */
+        private AcceptDocs buildAcceptDocs(LeafReaderContext context) throws IOException {
+            Bits liveDocs = context.reader().getLiveDocs();
+            if (filterWeight == null) {
+                if (liveDocs == null) {
+                    return ESAcceptDocs.ESAcceptDocsAll.INSTANCE;
+                }
+                return new ESAcceptDocs.BitsAcceptDocs(liveDocs, context.reader().maxDoc());
+            }
+            ScorerSupplier filterSupplier = filterWeight.scorerSupplier(context);
+            if (filterSupplier == null) {
+                return null;
+            }
+            return new LazyIteratorAcceptDocs(filterSupplier, liveDocs);
+        }
+
         @Override
         public Explanation explain(LeafReaderContext leafReaderContext, int i) throws IOException {
+            if (filterWeight != null) {
+                Explanation filterExplanation = filterWeight.explain(leafReaderContext, i);
+                if (filterExplanation.isMatch() == false) {
+                    return Explanation.noMatch("Document does not match filter", filterExplanation);
+                }
+            }
             VectorScorer vectorScorer = vectorScorer(leafReaderContext);
             if (vectorScorer == null) {
                 return Explanation.noMatch("No vector values found for field: " + field);
@@ -65,7 +137,7 @@ public abstract class DenseVectorQuery extends Query {
             iterator.advance(i);
             if (iterator.docID() == i) {
                 float score = vectorScorer.score();
-                return Explanation.match(vectorScorer.score() * boost, "found vector with calculated similarity: " + score);
+                return Explanation.match(score * boost, "found vector with calculated similarity: " + score);
             }
             return Explanation.noMatch("Document not found in vector values for field: " + field);
         }
@@ -76,7 +148,31 @@ public abstract class DenseVectorQuery extends Query {
             if (vectorScorer == null) {
                 return null;
             }
-            return new DefaultScorerSupplier(new DenseVectorScorer(vectorScorer, boost));
+            AcceptDocs acceptDocs = buildAcceptDocs(context);
+            if (acceptDocs == null) {
+                return null;
+            }
+            long cost = vectorScorer.iterator().cost();
+            return new ScorerSupplier() {
+                @Override
+                public Scorer get(long leadCost) throws IOException {
+                    DocIdSetIterator acceptIter = acceptDocs.iterator();
+                    DocIdSetIterator iterator = acceptIter == null
+                        ? vectorScorer.iterator()
+                        : ConjunctionUtils.intersectIterators(List.of(vectorScorer.iterator(), acceptIter));
+                    return new DenseVectorScorer(vectorScorer, iterator, boost);
+                }
+
+                @Override
+                public BulkScorer bulkScorer() throws IOException {
+                    return new DenseVectorBulkScorer(vectorScorer, acceptDocs, boost, cost);
+                }
+
+                @Override
+                public long cost() {
+                    return cost;
+                }
+            };
         }
 
         @Override
@@ -89,8 +185,8 @@ public abstract class DenseVectorQuery extends Query {
 
         private final float[] query;
 
-        public Floats(float[] query, String field) {
-            super(field);
+        public Floats(float[] query, String field, Query filter) {
+            super(field, filter);
             this.query = query;
         }
 
@@ -104,8 +200,23 @@ public abstract class DenseVectorQuery extends Query {
         }
 
         @Override
+        public Query rewrite(IndexSearcher indexSearcher) throws IOException {
+            if (filter == null)
+                return this;
+            Query rewritten = indexSearcher.rewrite(filter);
+            if (rewritten == filter) {
+                return this;
+            } else if (rewritten.getClass() == MatchNoDocsQuery.class) {
+                return rewritten;
+            } else {
+                return new Floats(query, field, rewritten);
+            }
+        }
+
+        @Override
         public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
-            return new DenseVectorWeight(Floats.this, boost) {
+            Weight filterWeight = super.createWeight(searcher, scoreMode, boost);
+            return new DenseVectorWeight(Floats.this, boost, filterWeight) {
                 @Override
                 VectorScorer vectorScorer(LeafReaderContext leafReaderContext) throws IOException {
                     FloatVectorValues vectorValues = leafReaderContext.reader().getFloatVectorValues(field);
@@ -122,12 +233,12 @@ public abstract class DenseVectorQuery extends Query {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Floats floats = (Floats) o;
-            return Objects.equals(field, floats.field) && Objects.deepEquals(query, floats.query);
+            return Objects.equals(field, floats.field) && Objects.deepEquals(query, floats.query) && Objects.equals(filter, floats.filter);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(field, Arrays.hashCode(query));
+            return Objects.hash(field, Arrays.hashCode(query), filter);
         }
     }
 
@@ -135,8 +246,8 @@ public abstract class DenseVectorQuery extends Query {
 
         private final byte[] query;
 
-        public Bytes(byte[] query, String field) {
-            super(field);
+        public Bytes(byte[] query, String field, Query filter) {
+            super(field, filter);
             this.query = query;
         }
 
@@ -146,8 +257,23 @@ public abstract class DenseVectorQuery extends Query {
         }
 
         @Override
+        public Query rewrite(IndexSearcher indexSearcher) throws IOException {
+            if (filter == null)
+                return this;
+            Query rewritten = indexSearcher.rewrite(filter);
+            if (rewritten.getClass() == MatchNoDocsQuery.class) {
+                return rewritten;
+            } else if (rewritten == filter) {
+                return this;
+            } else {
+                return new Bytes(query, field, rewritten);
+            }
+        }
+
+        @Override
         public Weight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
-            return new DenseVectorWeight(Bytes.this, boost) {
+            Weight filterWeight = super.createWeight(searcher, scoreMode, boost);
+            return new DenseVectorWeight(Bytes.this, boost, filterWeight) {
                 @Override
                 VectorScorer vectorScorer(LeafReaderContext leafReaderContext) throws IOException {
                     ByteVectorValues vectorValues = leafReaderContext.reader().getByteVectorValues(field);
@@ -164,12 +290,12 @@ public abstract class DenseVectorQuery extends Query {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Bytes bytes = (Bytes) o;
-            return Objects.equals(field, bytes.field) && Objects.deepEquals(query, bytes.query);
+            return Objects.equals(field, bytes.field) && Objects.deepEquals(query, bytes.query) && Objects.equals(filter, bytes.filter);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(field, Arrays.hashCode(query));
+            return Objects.hash(field, Arrays.hashCode(query), filter);
         }
     }
 
@@ -179,15 +305,15 @@ public abstract class DenseVectorQuery extends Query {
         private final DocIdSetIterator iterator;
         private final float boost;
 
-        DenseVectorScorer(VectorScorer vectorScorer, float boost) {
+        DenseVectorScorer(VectorScorer vectorScorer, DocIdSetIterator iterator, float boost) {
             this.vectorScorer = vectorScorer;
-            this.iterator = vectorScorer.iterator();
+            this.iterator = iterator;
             this.boost = boost;
         }
 
         @Override
         public DocIdSetIterator iterator() {
-            return vectorScorer.iterator();
+            return iterator;
         }
 
         @Override
@@ -208,4 +334,88 @@ public abstract class DenseVectorQuery extends Query {
         }
     }
 
+    private static class DenseVectorBulkScorer extends BulkScorer {
+        private final DocAndFloatFeatureBuffer buffer;
+        private final VectorScorer.Bulk bulkScorer;
+        private final float boost;
+        private final long cost;
+        private float currentScore = 0f;
+        private final Scorable scorable = new Scorable() {
+            @Override
+            public float score() {
+                return currentScore;
+            }
+        };
+
+        DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost) throws IOException {
+            this.bulkScorer = vectorScorer.bulk(acceptDocs.iterator());
+            this.buffer = new DocAndFloatFeatureBuffer();
+            this.boost = boost;
+            this.cost = cost;
+        }
+
+        @Override
+        public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
+            collector.setScorer(scorable);
+            while (true) {
+                bulkScorer.nextDocsAndScores(max, acceptDocs, buffer);
+                if (buffer.size == 0) {
+                    break;
+                }
+                for (int i = 0; i < buffer.size; i++) {
+                    int doc = buffer.docs[i];
+                    if (doc >= min) {
+                        // currentScore is closed over by scorable
+                        currentScore = buffer.features[i] * boost;
+                        collector.collect(doc);
+                    }
+                }
+            }
+            return DocIdSetIterator.NO_MORE_DOCS;
+        }
+
+        @Override
+        public long cost() {
+            return cost;
+        }
+    }
+
+    /**
+     * An {@link AcceptDocs} backed by a {@link ScorerSupplier} that supports only lazy iterator
+     * access. Calling {@link #bits()} or {@link #cost()} throws {@link UnsupportedOperationException}
+     * to prevent accidental eager bitset materialization. Only {@link #iterator()} may be called.
+     */
+    static final class LazyIteratorAcceptDocs extends AcceptDocs {
+        private final ScorerSupplier scorerSupplier;
+        private final Bits liveDocs;
+
+        LazyIteratorAcceptDocs(ScorerSupplier scorerSupplier, Bits liveDocs) {
+            this.scorerSupplier = scorerSupplier;
+            this.liveDocs = liveDocs;
+        }
+
+        @Override
+        public Bits bits() throws IOException {
+            throw new UnsupportedOperationException("LazyIteratorAcceptDocs does not support bits()");
+        }
+
+        @Override
+        public DocIdSetIterator iterator() throws IOException {
+            DocIdSetIterator filterIterator = scorerSupplier.get(Long.MAX_VALUE).iterator();
+            if (liveDocs == null) {
+                return filterIterator;
+            }
+            return new FilteredDocIdSetIterator(filterIterator) {
+                @Override
+                protected boolean match(int doc) {
+                    return liveDocs.get(doc);
+                }
+            };
+        }
+
+        @Override
+        public int cost() throws IOException {
+            throw new UnsupportedOperationException("LazyIteratorAcceptDocs does not support cost()");
+        }
+    }
 }

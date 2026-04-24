@@ -20,7 +20,7 @@ public class DenseVectorQueryBytesTests extends AbstractDenseVectorQueryTestCase
         for (int i = 0; i < query.length; i++) {
             bytes[i] = (byte) query[i];
         }
-        return new DenseVectorQuery.Bytes(bytes, field);
+        return new DenseVectorQuery.Bytes(bytes, field, null);
     }
 
     @Override

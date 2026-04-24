@@ -93,6 +93,8 @@ public abstract sealed class ESAcceptDocs extends AcceptDocs {
     /** An AcceptDocs that accepts all documents. */
     public static final class ESAcceptDocsAll extends ESAcceptDocs {
 
+        public static final ESAcceptDocsAll INSTANCE = new ESAcceptDocsAll();
+
         public ESAcceptDocsAll() {
             this(-1, null);
         }
