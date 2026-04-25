@@ -364,10 +364,10 @@ public abstract class DenseVectorQuery extends Query {
             }
 
             // TODO why do we need this value? Seems like there are conflicting contracts.
-            //  this javadoc says an under-estimation of the next matching doc after max,
-            //  and yeet AssertingBulkScorer expects that the last value is NO_MORE_DOCS.
-            //  We likely need to know from the bulk scorer more about remaining values,
-            //  or we should adjust javadocs.
+            // this javadoc says an under-estimation of the next matching doc after max,
+            // and yeet AssertingBulkScorer expects that the last value is NO_MORE_DOCS.
+            // We likely need to know from the bulk scorer more about remaining values,
+            // or we should adjust javadocs.
             return DocIdSetIterator.NO_MORE_DOCS;
         }
 
