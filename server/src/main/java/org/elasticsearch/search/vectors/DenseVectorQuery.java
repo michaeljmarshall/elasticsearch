@@ -325,6 +325,7 @@ public abstract class DenseVectorQuery extends Query {
     }
 
     private static class DenseVectorBulkScorer extends BulkScorer {
+        private final DocIdSetIterator iterator;
         private final DocAndFloatFeatureBuffer buffer;
         private final VectorScorer.Bulk bulkScorer;
         private final float boost;
@@ -338,7 +339,8 @@ public abstract class DenseVectorQuery extends Query {
         };
 
         DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost) throws IOException {
-            this.bulkScorer = vectorScorer.bulk(acceptDocs.iterator());
+            this.iterator = acceptDocs.iterator();
+            this.bulkScorer = vectorScorer.bulk(iterator);
             this.buffer = new DocAndFloatFeatureBuffer();
             this.boost = boost;
             this.cost = cost;
@@ -363,12 +365,9 @@ public abstract class DenseVectorQuery extends Query {
                 }
             }
 
-            // TODO why do we need this value? Seems like there are conflicting contracts.
-            // this javadoc says an under-estimation of the next matching doc after max,
-            // and yeet AssertingBulkScorer expects that the last value is NO_MORE_DOCS.
-            // We likely need to know from the bulk scorer more about remaining values,
-            // or we should adjust javadocs.
-            return DocIdSetIterator.NO_MORE_DOCS;
+            // TODO testing out what happens if we close over the iterator so we can maintain access
+            // to the next doc
+            return iterator.docID();
         }
 
         @Override
