@@ -349,11 +349,13 @@ public abstract class DenseVectorQuery extends Query {
         @Override
         public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
             collector.setScorer(scorable);
+            boolean hadHits = false;
             while (true) {
                 bulkScorer.nextDocsAndScores(max, acceptDocs, buffer);
                 if (buffer.size == 0) {
                     break;
                 }
+                hadHits = true;
                 for (int i = 0; i < buffer.size; i++) {
                     int doc = buffer.docs[i];
                     // TODO implement bulkScorer.advance?
@@ -367,7 +369,7 @@ public abstract class DenseVectorQuery extends Query {
 
             // TODO testing out what happens if we close over the iterator so we can maintain access
             // to the next doc
-            return iterator.docID();
+            return iterator != null ? iterator.docID() : hadHits ? max : DocIdSetIterator.NO_MORE_DOCS;
         }
 
         @Override
