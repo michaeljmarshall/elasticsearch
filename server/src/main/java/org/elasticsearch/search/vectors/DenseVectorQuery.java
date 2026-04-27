@@ -339,8 +339,7 @@ public abstract class DenseVectorQuery extends Query {
             }
         };
 
-        DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost, int maxDoc)
-            throws IOException {
+        DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost, int maxDoc) throws IOException {
             this.iterator = acceptDocs.iterator();
             this.bulkScorer = vectorScorer.bulk(iterator);
             this.buffer = new DocAndFloatFeatureBuffer();
