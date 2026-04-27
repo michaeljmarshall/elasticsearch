@@ -157,7 +157,7 @@ public abstract class DenseVectorQuery extends Query {
 
                 @Override
                 public BulkScorer bulkScorer() throws IOException {
-                    return new DenseVectorBulkScorer(vectorScorer, acceptDocs, boost, cost);
+                    return new DenseVectorBulkScorer(vectorScorer, acceptDocs, boost, cost, context.reader().maxDoc());
                 }
 
                 @Override
@@ -330,6 +330,7 @@ public abstract class DenseVectorQuery extends Query {
         private final VectorScorer.Bulk bulkScorer;
         private final float boost;
         private final long cost;
+        private final int maxDoc;
         private float currentScore = 0f;
         private final Scorable scorable = new Scorable() {
             @Override
@@ -338,24 +339,24 @@ public abstract class DenseVectorQuery extends Query {
             }
         };
 
-        DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost) throws IOException {
+        DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost, int maxDoc)
+            throws IOException {
             this.iterator = acceptDocs.iterator();
             this.bulkScorer = vectorScorer.bulk(iterator);
             this.buffer = new DocAndFloatFeatureBuffer();
             this.boost = boost;
             this.cost = cost;
+            this.maxDoc = maxDoc;
         }
 
         @Override
         public int score(LeafCollector collector, Bits acceptDocs, int min, int max) throws IOException {
             collector.setScorer(scorable);
-            boolean hadHits = false;
             while (true) {
                 bulkScorer.nextDocsAndScores(max, acceptDocs, buffer);
                 if (buffer.size == 0) {
                     break;
                 }
-                hadHits = true;
                 for (int i = 0; i < buffer.size; i++) {
                     int doc = buffer.docs[i];
                     // TODO implement bulkScorer.advance?
@@ -366,10 +367,13 @@ public abstract class DenseVectorQuery extends Query {
                     }
                 }
             }
-
-            // TODO testing out what happens if we close over the iterator so we can maintain access
-            // to the next doc
-            return iterator != null ? iterator.docID() : hadHits ? max : DocIdSetIterator.NO_MORE_DOCS;
+            // When there is a filter iterator, it shares state with the bulk scorer's internal
+            // conjunction, so its docID() reflects the next position (or NO_MORE_DOCS).
+            // Without a filter, use maxDoc to determine exhaustion: if max covers the entire leaf
+            // there can be no more docs, otherwise tell the caller to continue from max.
+            // TODO: there is likely an issue with wrapping the iterator here since our iterator might not be fully
+            // consumed but the bulkScorer intersects our iterator with the leaf's iterator.
+            return iterator != null ? iterator.docID() : max >= maxDoc ? DocIdSetIterator.NO_MORE_DOCS : max;
         }
 
         @Override
