@@ -325,7 +325,6 @@ public abstract class DenseVectorQuery extends Query {
     }
 
     private static class DenseVectorBulkScorer extends BulkScorer {
-        private final DocIdSetIterator iterator;
         private final DocAndFloatFeatureBuffer buffer;
         private final VectorScorer.Bulk bulkScorer;
         private final float boost;
@@ -340,8 +339,7 @@ public abstract class DenseVectorQuery extends Query {
         };
 
         DenseVectorBulkScorer(VectorScorer vectorScorer, AcceptDocs acceptDocs, float boost, long cost, int maxDoc) throws IOException {
-            this.iterator = acceptDocs.iterator();
-            this.bulkScorer = vectorScorer.bulk(iterator);
+            this.bulkScorer = vectorScorer.bulk(acceptDocs.iterator());
             this.buffer = new DocAndFloatFeatureBuffer();
             this.boost = boost;
             this.cost = cost;
@@ -366,13 +364,9 @@ public abstract class DenseVectorQuery extends Query {
                     }
                 }
             }
-            // When there is a filter iterator, it shares state with the bulk scorer's internal
-            // conjunction, so its docID() reflects the next position (or NO_MORE_DOCS).
-            // Without a filter, use maxDoc to determine exhaustion: if max covers the entire leaf
-            // there can be no more docs, otherwise tell the caller to continue from max.
-            // TODO: there is likely an issue with wrapping the iterator here since our iterator might not be fully
-            // consumed but the bulkScorer intersects our iterator with the leaf's iterator.
-            return iterator != null ? iterator.docID() : max >= maxDoc ? DocIdSetIterator.NO_MORE_DOCS : max;
+            // This is less efficient than it could be (we could eventually get the iterator#docID state from within the bulkScorer),
+            // but this satisfies the interface's requirement to return an under-estimation of the next matching doc.
+            return max < maxDoc ? max : DocIdSetIterator.NO_MORE_DOCS;
         }
 
         @Override
