@@ -221,7 +221,7 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
             }
 
             private void maybeCheckCancelled() {
-                if (calls++ % MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK == 0) {
+                if ((calls++ & (MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK - 1)) == 0) {
                     queryCancellation.checkCancelled();
                 }
             }
