@@ -171,6 +171,10 @@ public final class KnnRetrieverBuilder extends RetrieverBuilder {
         this.rescoreVectorBuilder = clone.rescoreVectorBuilder;
     }
 
+    public String getField() {
+        return field;
+    }
+
     @Override
     public String getName() {
         return NAME;

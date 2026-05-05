@@ -9,8 +9,13 @@
 
 package org.elasticsearch.action.search;
 
+import org.elasticsearch.cluster.metadata.IndexMetadata;
+import org.elasticsearch.cluster.metadata.MappingMetadata;
+import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.common.bytes.BytesArray;
+import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.TimeValue;
+import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.index.query.BoostingQueryBuilder;
 import org.elasticsearch.index.query.ConstantScoreQueryBuilder;
@@ -31,6 +36,7 @@ import org.elasticsearch.search.vectors.KnnSearchBuilder;
 import org.elasticsearch.search.vectors.KnnVectorQueryBuilder;
 import org.elasticsearch.test.ESTestCase;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 
@@ -523,5 +529,117 @@ public class SearchRequestAttributesExtractorTests extends ESTestCase {
             "older_than_14_days",
             SearchRequestAttributesExtractor.introspectTimeRange(randomLongBetween(0, fourteenDaysAgo), nowInMillis)
         );
+    }
+
+    @SuppressWarnings("unchecked")
+    public void testKnnFieldNamesCapturedFromTopLevelKnn() {
+        SearchRequest searchRequest = new SearchRequest();
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchRequest.source(searchSourceBuilder);
+        searchSourceBuilder.knnSearch(List.of(new KnnSearchBuilder("my_vector", new float[] {}, 2, 5, 10f, null, null)));
+        Map<String, Object> attributes = SearchRequestAttributesExtractor.extractAttributes(searchRequest, searchRequest.indices());
+        Collection<String> knnFieldNames = (Collection<String>) attributes.get(SearchRequestAttributesExtractor.KNN_FIELD_NAMES_ATTRIBUTE);
+        assertNotNull(knnFieldNames);
+        assertThat(knnFieldNames, org.hamcrest.Matchers.contains("my_vector"));
+    }
+
+    @SuppressWarnings("unchecked")
+    public void testKnnFieldNamesCapturedFromKnnQueryBuilder() {
+        SearchRequest searchRequest = new SearchRequest();
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchRequest.source(searchSourceBuilder);
+        searchSourceBuilder.query(new KnnVectorQueryBuilder("my_vector", new float[] {}, 2, 5, 10f, null, null));
+        Map<String, Object> attributes = SearchRequestAttributesExtractor.extractAttributes(searchRequest, searchRequest.indices());
+        Collection<String> knnFieldNames = (Collection<String>) attributes.get(SearchRequestAttributesExtractor.KNN_FIELD_NAMES_ATTRIBUTE);
+        assertNotNull(knnFieldNames);
+        assertThat(knnFieldNames, org.hamcrest.Matchers.contains("my_vector"));
+    }
+
+    @SuppressWarnings("unchecked")
+    public void testKnnFieldNamesCapturedFromKnnRetriever() {
+        SearchRequest searchRequest = new SearchRequest();
+        SearchSourceBuilder searchSourceBuilder = new SearchSourceBuilder();
+        searchRequest.source(searchSourceBuilder);
+        searchSourceBuilder.retriever(new KnnRetrieverBuilder("my_vector", new float[] {}, null, 2, 5, 10f, null, null));
+        Map<String, Object> attributes = SearchRequestAttributesExtractor.extractAttributes(searchRequest, searchRequest.indices());
+        Collection<String> knnFieldNames = (Collection<String>) attributes.get(SearchRequestAttributesExtractor.KNN_FIELD_NAMES_ATTRIBUTE);
+        assertNotNull(knnFieldNames);
+        assertThat(knnFieldNames, org.hamcrest.Matchers.contains("my_vector"));
+    }
+
+    public void testKnnFieldNamesAbsentForNonKnnSearch() {
+        SearchRequest searchRequest = new SearchRequest();
+        searchRequest.source(new SearchSourceBuilder().query(new MatchAllQueryBuilder()));
+        Map<String, Object> attributes = SearchRequestAttributesExtractor.extractAttributes(searchRequest, searchRequest.indices());
+        assertNull(attributes.get(SearchRequestAttributesExtractor.KNN_FIELD_NAMES_ATTRIBUTE));
+    }
+
+    public void testExtractVectorIndexTypeSingleIndex() {
+        ProjectMetadata projectMetadata = buildProjectMetadataWithVectorField("my-index", "my_vector", "int8_hnsw");
+        String result = SearchRequestAttributesExtractor.extractVectorIndexType(
+            projectMetadata,
+            new String[] { "my-index" },
+            List.of("my_vector")
+        );
+        assertEquals("int8_hnsw", result);
+    }
+
+    public void testExtractVectorIndexTypeMultipleIndicesSameType() {
+        ProjectMetadata projectMetadata = ProjectMetadata.builder(org.elasticsearch.cluster.metadata.ProjectId.DEFAULT)
+            .put(buildIndexMetadataWithVectorField("index-a", "my_vector", "bbq_hnsw"), false)
+            .put(buildIndexMetadataWithVectorField("index-b", "my_vector", "bbq_hnsw"), false)
+            .build();
+        String result = SearchRequestAttributesExtractor.extractVectorIndexType(
+            projectMetadata,
+            new String[] { "index-a", "index-b" },
+            List.of("my_vector")
+        );
+        assertEquals("bbq_hnsw", result);
+    }
+
+    public void testExtractVectorIndexTypeMultipleIndicesMixedTypes() {
+        ProjectMetadata projectMetadata = ProjectMetadata.builder(org.elasticsearch.cluster.metadata.ProjectId.DEFAULT)
+            .put(buildIndexMetadataWithVectorField("index-a", "my_vector", "hnsw"), false)
+            .put(buildIndexMetadataWithVectorField("index-b", "my_vector", "flat"), false)
+            .build();
+        String result = SearchRequestAttributesExtractor.extractVectorIndexType(
+            projectMetadata,
+            new String[] { "index-a", "index-b" },
+            List.of("my_vector")
+        );
+        assertEquals("mixed", result);
+    }
+
+    public void testExtractVectorIndexTypeUnknownWhenFieldMissing() {
+        ProjectMetadata projectMetadata = buildProjectMetadataWithVectorField("my-index", "other_field", "hnsw");
+        String result = SearchRequestAttributesExtractor.extractVectorIndexType(
+            projectMetadata,
+            new String[] { "my-index" },
+            List.of("my_vector")
+        );
+        assertEquals("unknown", result);
+    }
+
+    public void testExtractVectorIndexTypeUnknownWhenNoFieldNames() {
+        ProjectMetadata projectMetadata = buildProjectMetadataWithVectorField("my-index", "my_vector", "flat");
+        String result = SearchRequestAttributesExtractor.extractVectorIndexType(projectMetadata, new String[] { "my-index" }, List.of());
+        assertEquals("unknown", result);
+    }
+
+    private static ProjectMetadata buildProjectMetadataWithVectorField(String indexName, String fieldName, String indexType) {
+        return ProjectMetadata.builder(org.elasticsearch.cluster.metadata.ProjectId.DEFAULT)
+            .put(buildIndexMetadataWithVectorField(indexName, fieldName, indexType), false)
+            .build();
+    }
+
+    private static IndexMetadata buildIndexMetadataWithVectorField(String indexName, String fieldName, String indexType) {
+        Map<String, Object> fieldMapping = Map.of("type", "dense_vector", "index_options", Map.of("type", indexType));
+        Map<String, Object> mappingSource = Map.of("properties", Map.of(fieldName, fieldMapping));
+        return IndexMetadata.builder(indexName)
+            .settings(Settings.builder().put(IndexMetadata.SETTING_VERSION_CREATED, IndexVersion.current()))
+            .numberOfShards(1)
+            .numberOfReplicas(0)
+            .putMapping(new MappingMetadata("_doc", mappingSource))
+            .build();
     }
 }
