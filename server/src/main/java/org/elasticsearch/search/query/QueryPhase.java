@@ -46,6 +46,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 
 import static org.elasticsearch.search.internal.SearchContext.TRACK_TOTAL_HITS_DISABLED;
@@ -159,6 +160,10 @@ public class QueryPhase {
         final IndexReader reader = searcher.getIndexReader();
         QuerySearchResult queryResult = searchContext.queryResult();
         queryResult.setTimeRangeFilterFromMillis(timeRangeFilterFromMillis);
+        Set<String> vectorIndexTypes = searchContext.getSearchExecutionContext().getVectorIndexTypes();
+        if (vectorIndexTypes.isEmpty() == false) {
+            queryResult.setVectorIndexType(vectorIndexTypes.size() == 1 ? vectorIndexTypes.iterator().next() : "mixed");
+        }
         queryResult.searchTimedOut(false);
         try {
             queryResult.from(searchContext.from());

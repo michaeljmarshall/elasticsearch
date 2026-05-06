@@ -476,11 +476,10 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
 
             final ActionListener<SearchResponse> searchResponseActionListener;
             if (collectSearchTelemetry) {
-                String[] localIndexNames = Arrays.stream(resolvedIndices.getConcreteLocalIndices())
-                    .map(Index::getName)
-                    .toArray(String[]::new);
-                Map<String, Object> searchRequestAttributes = SearchRequestAttributesExtractor.extractAttributes(original, localIndexNames);
-                resolveAndAddVectorIndexType(searchRequestAttributes, localIndexNames, projectState.metadata());
+                Map<String, Object> searchRequestAttributes = SearchRequestAttributesExtractor.extractAttributes(
+                    original,
+                    Arrays.stream(resolvedIndices.getConcreteLocalIndices()).map(Index::getName).toArray(String[]::new)
+                );
                 if (collectCCSTelemetry == false || resolvedIndices.getRemoteClusterIndices().isEmpty()) {
                     searchResponseActionListener = new SearchTelemetryListener(
                         delegate,
@@ -2568,22 +2567,6 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         return Arrays.asList(list);
     }
 
-    @SuppressWarnings("unchecked")
-    private static void resolveAndAddVectorIndexType(
-        Map<String, Object> searchRequestAttributes,
-        String[] localIndexNames,
-        ProjectMetadata projectMetadata
-    ) {
-        if (searchRequestAttributes.containsKey(SearchRequestAttributesExtractor.KNN_ATTRIBUTE) == false) {
-            return;
-        }
-        Collection<String> knnFieldNames = (Collection<String>) searchRequestAttributes.get(
-            SearchRequestAttributesExtractor.KNN_FIELD_NAMES_ATTRIBUTE
-        );
-        String vectorIndexType = SearchRequestAttributesExtractor.extractVectorIndexType(projectMetadata, localIndexNames, knnFieldNames);
-        searchRequestAttributes.put(SearchRequestAttributesExtractor.VECTOR_INDEX_TYPE_ATTRIBUTE, vectorIndexType);
-    }
-
     static String[] ignoreBlockedIndices(ProjectState projectState, String[] concreteIndices) {
         // optimization: mostly we do not have any blocks so there's no point in the expensive per-index checking
         boolean hasIndexBlocks = projectState.blocks().indices(projectState.projectId()).isEmpty() == false;
@@ -2642,6 +2625,12 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
         @Override
         public void onResponse(SearchResponse searchResponse) {
             try {
+                if (searchResponse.getVectorIndexType() != null) {
+                    searchRequestAttributes.put(
+                        SearchRequestAttributesExtractor.VECTOR_INDEX_TYPE_ATTRIBUTE,
+                        searchResponse.getVectorIndexType()
+                    );
+                }
                 searchResponseMetrics.recordTookTime(
                     searchResponse.getTookInMillis(),
                     searchResponse.getTimeRangeFilterFromMillis(),

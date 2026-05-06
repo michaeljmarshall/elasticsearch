@@ -13,8 +13,6 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.cluster.metadata.DataStream;
 import org.elasticsearch.cluster.metadata.IndexMetadata;
-import org.elasticsearch.cluster.metadata.MappingMetadata;
-import org.elasticsearch.cluster.metadata.ProjectMetadata;
 import org.elasticsearch.common.regex.Regex;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.core.TimeValue;
@@ -37,13 +35,8 @@ import org.elasticsearch.search.sort.ScoreSortBuilder;
 import org.elasticsearch.search.sort.SortBuilder;
 import org.elasticsearch.search.vectors.KnnVectorQueryBuilder;
 
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
  * Used to introspect a search request and extract metadata from it around the features it uses.
@@ -99,7 +92,7 @@ public final class SearchRequestAttributesExtractor {
         }
 
         if (searchSourceBuilder == null) {
-            return buildAttributesMap(target, ScoreSortBuilder.NAME, HITS_ONLY, false, List.of(), false, false, pitOrScroll, null);
+            return buildAttributesMap(target, ScoreSortBuilder.NAME, HITS_ONLY, false, false, false, pitOrScroll, null);
         }
 
         if (searchSourceBuilder.pointInTimeBuilder() != null) {
@@ -133,15 +126,6 @@ public final class SearchRequestAttributesExtractor {
         }
 
         final boolean hasKnn = searchSourceBuilder.knnSearch().isEmpty() == false || queryMetadataBuilder.knnQuery;
-        final List<String> knnFieldNames;
-        if (hasKnn) {
-            knnFieldNames = new ArrayList<>(queryMetadataBuilder.knnFieldNames);
-            for (var knnSearch : searchSourceBuilder.knnSearch()) {
-                knnFieldNames.add(knnSearch.getField());
-            }
-        } else {
-            knnFieldNames = List.of();
-        }
         String timeRangeFilterFrom = null;
         if (timeRangeFilterFromMillis != null) {
             timeRangeFilterFrom = introspectTimeRange(timeRangeFilterFromMillis, nowInMillis);
@@ -151,7 +135,6 @@ public final class SearchRequestAttributesExtractor {
             primarySort,
             queryType,
             hasKnn,
-            knnFieldNames,
             queryMetadataBuilder.rangeOnTimestamp,
             queryMetadataBuilder.rangeOnEventIngested,
             pitOrScroll,
@@ -164,7 +147,6 @@ public final class SearchRequestAttributesExtractor {
         String primarySort,
         String queryType,
         boolean knn,
-        List<String> knnFieldNames,
         boolean rangeOnTimestamp,
         boolean rangeOnEventIngested,
         String pitOrScroll,
@@ -179,9 +161,6 @@ public final class SearchRequestAttributesExtractor {
         }
         if (knn) {
             attributes.put(KNN_ATTRIBUTE, knn);
-            if (knnFieldNames.isEmpty() == false) {
-                attributes.put(KNN_FIELD_NAMES_ATTRIBUTE, knnFieldNames);
-            }
         }
         if (rangeOnTimestamp && rangeOnEventIngested) {
             attributes.put(
@@ -203,7 +182,6 @@ public final class SearchRequestAttributesExtractor {
         private boolean knnQuery = false;
         private boolean rangeOnTimestamp = false;
         private boolean rangeOnEventIngested = false;
-        private final List<String> knnFieldNames = new ArrayList<>();
     }
 
     public static final String TARGET_ATTRIBUTE = "target";
@@ -211,7 +189,6 @@ public final class SearchRequestAttributesExtractor {
     public static final String QUERY_TYPE_ATTRIBUTE = "query_type";
     public static final String PIT_SCROLL_ATTRIBUTE = "pit_scroll";
     public static final String KNN_ATTRIBUTE = "knn";
-    public static final String KNN_FIELD_NAMES_ATTRIBUTE = "knn_field_names";
     public static final String VECTOR_INDEX_TYPE_ATTRIBUTE = "vector_index_type";
     public static final String TIME_RANGE_FILTER_FIELD_ATTRIBUTE = "time_range_filter_field";
     public static final String TIME_RANGE_FILTER_FROM_ATTRIBUTE = "time_range_filter_from";
@@ -378,7 +355,6 @@ public final class SearchRequestAttributesExtractor {
                 break;
             case KnnVectorQueryBuilder knn:
                 queryMetadataBuilder.knnQuery = true;
-                queryMetadataBuilder.knnFieldNames.add(knn.getFieldName());
                 break;
             default:
         }
@@ -391,7 +367,6 @@ public final class SearchRequestAttributesExtractor {
         switch (retrieverBuilder) {
             case KnnRetrieverBuilder knn:
                 queryMetadataBuilder.knnQuery = true;
-                queryMetadataBuilder.knnFieldNames.add(knn.getField());
                 break;
             case StandardRetrieverBuilder standard:
                 introspectQueryBuilder(standard.topDocsQuery(), queryMetadataBuilder, level + 1);
@@ -403,63 +378,6 @@ public final class SearchRequestAttributesExtractor {
                 break;
             default:
         }
-    }
-
-    /**
-     * Resolves the vector index type for a KNN search by inspecting the dense_vector field mapping
-     * for each concrete local index. Returns the {@code index_options.type} value (e.g. {@code "int8_hnsw"},
-     * {@code "bbq_disk"}, {@code "flat"}) from the mapping source. Returns {@code "mixed"} when multiple
-     * distinct types are found across indices, and {@code "unknown"} when the type cannot be determined.
-     */
-    public static String extractVectorIndexType(ProjectMetadata projectMetadata, String[] localIndices, Collection<String> knnFieldNames) {
-        if (knnFieldNames == null || knnFieldNames.isEmpty() || localIndices == null || localIndices.length == 0) {
-            return "unknown";
-        }
-        try {
-            Set<String> indexTypes = new HashSet<>();
-            for (String indexName : localIndices) {
-                IndexMetadata indexMd = projectMetadata.index(indexName);
-                if (indexMd == null) {
-                    continue;
-                }
-                MappingMetadata mapping = indexMd.mapping();
-                if (mapping == null) {
-                    continue;
-                }
-                Map<String, Object> sourceMap = mapping.sourceAsMap();
-                for (String fieldName : knnFieldNames) {
-                    String indexType = extractIndexTypeFromMappingSource(sourceMap, fieldName);
-                    if (indexType != null) {
-                        indexTypes.add(indexType);
-                    }
-                }
-            }
-            if (indexTypes.isEmpty()) {
-                return "unknown";
-            }
-            return indexTypes.size() == 1 ? indexTypes.iterator().next() : "mixed";
-        } catch (Exception e) {
-            logger.debug("Failed to extract vector index type", e);
-            return "unknown";
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private static String extractIndexTypeFromMappingSource(Map<String, Object> sourceMap, String fieldName) {
-        Map<String, Object> properties = (Map<String, Object>) sourceMap.get("properties");
-        if (properties == null) {
-            return null;
-        }
-        Map<String, Object> fieldDef = (Map<String, Object>) properties.get(fieldName);
-        if (fieldDef == null) {
-            return null;
-        }
-        Map<String, Object> indexOptions = (Map<String, Object>) fieldDef.get("index_options");
-        if (indexOptions == null) {
-            return null;
-        }
-        Object type = indexOptions.get("type");
-        return type instanceof String s ? s : null;
     }
 
     private enum TimeRangeBucket {
