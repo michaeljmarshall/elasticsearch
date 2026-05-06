@@ -57,7 +57,7 @@ public class SearchPhaseCoordinatorAPMMetricsTests extends ESSingleNodeTestCase 
     private static final String FETCH_SEARCH_PHASE_METRIC = "es.search_response.took_durations.fetch.histogram";
     private static final String OPEN_PIT_SEARCH_PHASE_METRIC = "es.search_response.took_durations.open_pit.histogram";
     private static final String QUERY_SEARCH_PHASE_METRIC = "es.search_response.took_durations.query.histogram";
-    private static final String VECTOR_SEARCH_METRIC = SearchResponseMetrics.TOOK_DURATION_VECTOR_SEARCH_HISTOGRAM_NAME;
+    private static final String TOOK_DURATION_TOTAL_HISTOGRAM = SearchResponseMetrics.TOOK_DURATION_TOTAL_HISTOGRAM_NAME;
 
     private static final String vectorIndexName = "test_vector_search_metrics";
 
@@ -231,7 +231,7 @@ public class SearchPhaseCoordinatorAPMMetricsTests extends ESSingleNodeTestCase 
         assertMeasurements(List.of(CAN_MATCH_SEARCH_PHASE_METRIC), 1);
     }
 
-    public void testVectorSearchRecordsHistogram() {
+    public void testVectorSearchSetsVectorIndexTypeAttribute() {
         assertSearchHitsWithoutFailures(
             client().prepareSearch(vectorIndexName)
                 .setKnnSearch(
@@ -249,17 +249,18 @@ public class SearchPhaseCoordinatorAPMMetricsTests extends ESSingleNodeTestCase 
                 ),
             "v1"
         );
-        List<Measurement> measurements = getTestTelemetryPlugin().getLongHistogramMeasurement(VECTOR_SEARCH_METRIC);
+        List<Measurement> measurements = getTestTelemetryPlugin().getLongHistogramMeasurement(TOOK_DURATION_TOTAL_HISTOGRAM);
         assertThat(measurements, hasSize(1));
         Map<String, Object> attributes = measurements.getFirst().attributes();
         assertEquals("flat", attributes.get(SearchRequestAttributesExtractor.VECTOR_INDEX_TYPE_ATTRIBUTE));
         assertEquals(true, attributes.get(SearchRequestAttributesExtractor.KNN_ATTRIBUTE));
     }
 
-    public void testNonVectorSearchDoesNotRecordVectorHistogram() {
+    public void testNonVectorSearchDoesNotSetVectorIndexTypeAttribute() {
         assertSearchHitsWithoutFailures(client().prepareSearch(indexName).setQuery(simpleQueryStringQuery("doc1")), "1");
-        List<Measurement> measurements = getTestTelemetryPlugin().getLongHistogramMeasurement(VECTOR_SEARCH_METRIC);
-        assertThat(measurements, hasSize(0));
+        List<Measurement> measurements = getTestTelemetryPlugin().getLongHistogramMeasurement(TOOK_DURATION_TOTAL_HISTOGRAM);
+        assertThat(measurements, hasSize(1));
+        assertNull(measurements.getFirst().attributes().get(SearchRequestAttributesExtractor.VECTOR_INDEX_TYPE_ATTRIBUTE));
     }
 
     private void resetMeter() {

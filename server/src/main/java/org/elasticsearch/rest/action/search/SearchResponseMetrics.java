@@ -43,12 +43,10 @@ public class SearchResponseMetrics {
     public static final String RESPONSE_COUNT_TOTAL_STATUS_ATTRIBUTE_NAME = "response_status";
 
     public static final String TOOK_DURATION_TOTAL_HISTOGRAM_NAME = "es.search_response.took_durations.histogram";
-    public static final String TOOK_DURATION_VECTOR_SEARCH_HISTOGRAM_NAME = "es.search_response.took_durations.vector_search.histogram";
     public static final String RESPONSE_COUNT_TOTAL_COUNTER_NAME = "es.search_response.response_count.total";
     private static final String SEARCH_PHASE_METRIC_FORMAT = "es.search_response.took_durations.%s.histogram";
 
     private final LongHistogram tookDurationTotalMillisHistogram;
-    private final LongHistogram vectorSearchTookDurationMillisHistogram;
     private final LongCounter responseCountTotalCounter;
 
     private final Map<String, LongHistogram> phaseNameToDurationHistogram;
@@ -57,11 +55,6 @@ public class SearchResponseMetrics {
         this.tookDurationTotalMillisHistogram = meterRegistry.registerLongHistogram(
             TOOK_DURATION_TOTAL_HISTOGRAM_NAME,
             "The SearchResponse.took durations in milliseconds, expressed as a histogram",
-            "millis"
-        );
-        this.vectorSearchTookDurationMillisHistogram = meterRegistry.registerLongHistogram(
-            TOOK_DURATION_VECTOR_SEARCH_HISTOGRAM_NAME,
-            "The SearchResponse.took durations in milliseconds for vector (KNN) searches, expressed as a histogram",
             "millis"
         );
         this.responseCountTotalCounter = meterRegistry.registerLongCounter(
@@ -121,10 +114,6 @@ public class SearchResponseMetrics {
         SearchRequestAttributesExtractor.addTimeRangeAttribute(timeRangeFilterFromMillis, nowInMillis, attributes);
         tookDurationTotalMillisHistogram.record(tookTime, attributes);
         return tookTime;
-    }
-
-    public void recordVectorSearchTookTime(long tookTimeMillis, Map<String, Object> attributes) {
-        vectorSearchTookDurationMillisHistogram.record(tookTimeMillis, attributes);
     }
 
     public void incrementResponseCount(ResponseCountTotalStatus responseCountTotalStatus) {

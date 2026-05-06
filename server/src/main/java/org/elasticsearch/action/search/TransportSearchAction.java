@@ -2648,9 +2648,6 @@ public class TransportSearchAction extends HandledTransportAction<SearchRequest,
                     nowInMillis,
                     searchRequestAttributes
                 );
-                if (searchRequestAttributes.containsKey(SearchRequestAttributesExtractor.KNN_ATTRIBUTE)) {
-                    searchResponseMetrics.recordVectorSearchTookTime(searchResponse.getTookInMillis(), searchRequestAttributes);
-                }
                 SearchResponseMetrics.ResponseCountTotalStatus responseCountTotalStatus =
                     SearchResponseMetrics.ResponseCountTotalStatus.SUCCESS;
                 if (searchResponse.getShardFailures() != null && searchResponse.getShardFailures().length > 0) {
