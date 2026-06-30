@@ -9,14 +9,14 @@
 
 package org.elasticsearch.index.mapper.vectors;
 
+import org.apache.lucene.util.BitUtil;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.index.IndexVersion;
 import org.elasticsearch.index.codec.vectors.BFloat16;
 import org.elasticsearch.simdvec.ESVectorUtil;
 
-import java.nio.ByteBuffer;
+import java.lang.invoke.VarHandle;
 import java.nio.ByteOrder;
-import java.nio.FloatBuffer;
 
 import static org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper.LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION;
 import static org.elasticsearch.index.mapper.vectors.DenseVectorFieldMapper.MAGNITUDE_STORED_INDEX_VERSION;
@@ -39,10 +39,10 @@ public final class VectorEncoderDecoder {
      */
     public static float decodeMagnitude(IndexVersion indexVersion, BytesRef vectorBR) {
         assert indexVersion.onOrAfter(MAGNITUDE_STORED_INDEX_VERSION);
-        ByteBuffer byteBuffer = indexVersion.onOrAfter(LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION)
-            ? ByteBuffer.wrap(vectorBR.bytes, vectorBR.offset, vectorBR.length).order(ByteOrder.LITTLE_ENDIAN)
-            : ByteBuffer.wrap(vectorBR.bytes, vectorBR.offset, vectorBR.length);
-        return byteBuffer.getFloat(vectorBR.offset + vectorBR.length - INT_BYTES);
+        int offset = vectorBR.offset + vectorBR.length - INT_BYTES;
+        return indexVersion.onOrAfter(LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION)
+            ? (float) BitUtil.VH_LE_FLOAT.get(vectorBR.bytes, offset)
+            : (float) BitUtil.VH_BE_FLOAT.get(vectorBR.bytes, offset);
     }
 
     /**
@@ -72,16 +72,9 @@ public final class VectorEncoderDecoder {
         if (vectorBR == null) {
             throw new IllegalArgumentException(DenseVectorScriptDocValues.MISSING_VECTOR_FIELD_MESSAGE);
         }
-        if (indexVersion.onOrAfter(LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION)) {
-            FloatBuffer fb = ByteBuffer.wrap(vectorBR.bytes, vectorBR.offset, vectorBR.length)
-                .order(ByteOrder.LITTLE_ENDIAN)
-                .asFloatBuffer();
-            fb.get(vector);
-        } else {
-            ByteBuffer byteBuffer = ByteBuffer.wrap(vectorBR.bytes, vectorBR.offset, vectorBR.length);
-            for (int dim = 0; dim < vector.length; dim++) {
-                vector[dim] = byteBuffer.getFloat((dim * Float.BYTES) + vectorBR.offset);
-            }
+        VarHandle vh = indexVersion.onOrAfter(LITTLE_ENDIAN_FLOAT_STORED_INDEX_VERSION) ? BitUtil.VH_LE_FLOAT : BitUtil.VH_BE_FLOAT;
+        for (int i = 0; i < vector.length; i++) {
+            vector[i] = (float) vh.get(vectorBR.bytes, vectorBR.offset + i * Float.BYTES);
         }
     }
 
@@ -115,9 +108,8 @@ public final class VectorEncoderDecoder {
     public static float[] getMultiMagnitudes(BytesRef magnitudes) {
         assert magnitudes.length % Float.BYTES == 0;
         float[] multiMagnitudes = new float[magnitudes.length / Float.BYTES];
-        ByteBuffer byteBuffer = ByteBuffer.wrap(magnitudes.bytes, magnitudes.offset, magnitudes.length).order(ByteOrder.LITTLE_ENDIAN);
-        for (int i = 0; i < magnitudes.length / Float.BYTES; i++) {
-            multiMagnitudes[i] = byteBuffer.getFloat();
+        for (int i = 0; i < multiMagnitudes.length; i++) {
+            multiMagnitudes[i] = (float) BitUtil.VH_LE_FLOAT.get(magnitudes.bytes, magnitudes.offset + i * Float.BYTES);
         }
         return multiMagnitudes;
     }
