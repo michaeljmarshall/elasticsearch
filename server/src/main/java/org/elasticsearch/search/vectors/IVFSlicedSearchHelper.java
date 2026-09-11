@@ -17,8 +17,6 @@ import org.apache.lucene.search.AcceptDocs;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.ScorerSupplier;
-import org.apache.lucene.search.Sort;
-import org.apache.lucene.search.SortField;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.TopDocsCollector;
 import org.apache.lucene.search.Weight;
@@ -70,14 +68,9 @@ final class IVFSlicedSearchHelper {
         }
         final Bits liveDocs = reader.getLiveDocs();
         final int maxDoc = reader.maxDoc();
-        final Sort sort = reader.getMetaData().sort();
-        if (sort == null
-            || sort.getSort().length == 0
-            || sort.getSort()[0].getField().equals(sliceField) == false
-            || sort.getSort()[0].getType() != SortField.Type.STRING
-            || sort.getSort()[0].getReverse()) {
-            throw new IllegalArgumentException("sliceField must be the first field of the index sort and of type STRING");
-        }
+        // The slice bounds computed below are only correct if the index sort is the slice field, STRING, ascending,
+        // with missing values last. ESNextDiskBBQVectorsFormat#validateSliceSort enforces that when a segment is
+        // written and again when it is opened, so it is not re-checked per search.
 
         final IVFKnnSearchStrategy strategy = new IVFKnnSearchStrategy(visitRatio, numCands, k, knnCollectorManager.longAccumulator);
         final AbstractMaxScoreKnnCollector knnCollector = knnCollectorManager.newCollector(Integer.MAX_VALUE, strategy, ctx);
@@ -105,14 +98,9 @@ final class IVFSlicedSearchHelper {
         if (skipper == null) {
             throw new IllegalArgumentException("sliceField [" + sliceField + "] must be indexed as a DocValuesSkipper field");
         }
-        final SortField sliceSort = sort.getSort()[0];
-        // Internal soft-deleted documents such as tombstones may not carry the slice field. With an ascending,
-        // missing-last index sort, documents that have a slice remain a contiguous prefix ending at docCount().
-        if (skipper.docCount() != maxDoc && sliceSort.getMissingValue() != SortField.STRING_LAST) {
-            throw new IllegalArgumentException(
-                "sparse sliceField [" + sliceField + "] requires ascending index sort with missing values last"
-            );
-        }
+        // skipper.docCount() may be smaller than maxDoc: internal soft-deleted documents such as tombstones carry no
+        // slice field. Under the ascending, missing-last sort they form a trailing suffix, so docCount() is still the
+        // end of the last slice.
 
         final IOSupplier<DocIdSetIterator> docIdIteratorSupplier;
         final LongSupplier costSupplier;
