@@ -1249,10 +1249,11 @@ public class IndexDirectory extends ByteSizeDirectory {
         }
 
         /**
-         * While the file is still local (not yet uploaded, read from disk) every byte is in the local tier, so the honest
-         * answer is {@link Outcome#RESIDENT}: nothing needs fetching and the caller should not deepen its window. Once the
-         * input has been reopened from the cache, the request is forwarded to the {@link BlobCacheIndexInput} underneath.
-         * This adds no object-store fetching on the indexing tier beyond what the cached input already does.
+         * Once the input has been reopened from the cache, the request is forwarded to the {@link BlobCacheIndexInput}
+         * underneath. Any other delegate has no remote tier behind it: either the file is still local (not yet uploaded,
+         * read from disk) or the cached slice was small enough to be copied onto the heap. In both cases every byte is in
+         * the local tier, so the honest answer is {@link Outcome#RESIDENT}: nothing needs fetching and the caller should not
+         * deepen its window. This adds no object-store fetching on the indexing tier beyond what the cached input already does.
          */
         @Override
         public Outcome ensureResident(long offset, long length) throws IOException {
@@ -1262,7 +1263,7 @@ public class IndexDirectory extends ByteSizeDirectory {
                 if (inner instanceof TieredPrefetchInput tiered) {
                     return tiered.ensureResident(offset, length);
                 }
-                return current.isCached() ? Outcome.SKIPPED : Outcome.RESIDENT;
+                return Outcome.RESIDENT;
             });
         }
 
@@ -1277,7 +1278,7 @@ public class IndexDirectory extends ByteSizeDirectory {
                 if (inner instanceof TieredPrefetchInput tiered) {
                     tiered.ensureResident(offsets, length, count, outcomes);
                 } else {
-                    Arrays.fill(outcomes, 0, count, current.isCached() ? Outcome.SKIPPED : Outcome.RESIDENT);
+                    Arrays.fill(outcomes, 0, count, Outcome.RESIDENT);
                 }
                 return null;
             });

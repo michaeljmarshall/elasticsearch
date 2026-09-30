@@ -595,6 +595,59 @@ public class CacheFileReaderTests extends ESTestCase {
     }
 
     /**
+     * Joining an in-flight region must still cover the caller's bytes. The budget tracks regions, but a fetch may cover
+     * only part of a region when the blob reader's range is smaller than the region, as when reading from an indexing
+     * node in chunks. Here the reader fetches one page at a time: the first request fetches page 0, and a joined request
+     * for page 2 of the same region must issue its own fetch rather than trust the region key, while still taking no
+     * budget slot.
+     */
+    public void testEnsureResidentJoinedRegionStillFetchesRequestedBytes() throws Exception {
+        Settings settings = nodeSettings();
+        BlobCacheMetrics metrics = new BlobCacheMetrics(new RecordingMeterRegistry(), NOOP_TIME_PROVIDER);
+
+        try (
+            NodeEnvironment env = new NodeEnvironment(settings, TestEnvironment.newEnvironment(settings));
+            StatelessSharedBlobCacheService service = newCacheService(env, settings, threadPool)
+        ) {
+            String fileName = "ensure-resident-join-partial";
+            byte[] blob = randomByteArrayOfLength(BLOB_LENGTH); // one region of REGION_PAGES pages
+            FileCacheKey cacheKey = new FileCacheKey(new ShardId(new Index("idx", "uid"), 0), 1L, fileName);
+            AtomicInteger fetchCount = new AtomicInteger();
+            CountDownLatch gate = new CountDownLatch(1);
+            PrefetchBudget budget = new PrefetchBudget(randomIntBetween(1, 8));
+            // page-sized ranges, so each fetch covers a single page of the region rather than the whole region
+            CacheFileReader cacheFileReader = newReader(
+                service,
+                cacheKey,
+                blob,
+                gatedObjectStoreReader(fileName, blob, SharedBytes.PAGE_SIZE, fetchCount, gate),
+                metrics,
+                true,
+                budget
+            );
+
+            assertThat(cacheFileReader.ensureResident(0L, 1L), equalTo(Outcome.FETCHING));
+            assertThat(budget.inFlightRegions(), equalTo(1));
+            assertBusy(() -> assertThat(fetchCount.get(), equalTo(1)));
+
+            long otherPage = 2L * SharedBytes.PAGE_SIZE;
+            assertThat(
+                "another sub-range of the in-flight region joins",
+                cacheFileReader.ensureResident(otherPage, 1L),
+                equalTo(Outcome.FETCHING)
+            );
+            assertThat("joining must not take another slot", budget.inFlightRegions(), equalTo(1));
+            assertBusy(() -> assertThat("the joined request must fetch its own bytes", fetchCount.get(), equalTo(2)));
+
+            gate.countDown();
+            assertBusy(() -> assertThat(budget.inFlightRegions(), equalTo(0)));
+            assertBusy(() -> assertThat(cacheFileReader.ensureResident(otherPage, 1L), equalTo(Outcome.RESIDENT)));
+            assertThat(cacheFileReader.ensureResident(0L, 1L), equalTo(Outcome.RESIDENT));
+            assertThat("no further fetch once both pages are cached", fetchCount.get(), equalTo(2));
+        }
+    }
+
+    /**
      * With the budget full, a miss on a different region is {@link Outcome#SKIPPED} and starts no fetch. Once a slot is
      * released the same request is admitted.
      */

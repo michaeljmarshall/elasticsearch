@@ -295,25 +295,49 @@ public class StoreMetricsIndexInputTests extends ESTestCase {
     }
 
     /**
-     * Over a plain input there is no remote tier: every range is reported skipped, and the whole input counts as one
-     * region so callers have nothing to group by.
+     * Over a plain input the wrapper must not claim the tiered-prefetch capability. Callers stop issuing plain
+     * {@code prefetch} hints once they see a {@link TieredPrefetchInput}, and every shard directory on local storage is
+     * wrapped for metrics, so claiming it here would silently disable prefetch on local storage. The plain hint must still
+     * be forwarded. This holds for both the plain and the random-access wrapper.
      */
-    public void testTieredPrefetchOverPlainInput() throws IOException {
+    public void testTieredPrefetchNotClaimedOverPlainInput() throws IOException {
         PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder = new ThreadLocalDirectoryMetricHolder<>(StoreMetrics::new);
         IndexInput plain = mock(IndexInput.class);
-        when(plain.length()).thenReturn(1234L);
+        IndexInput wrapped = StoreMetricsIndexInput.create("test", plain, metricHolder);
+        assertTrue(wrapped instanceof StoreMetricsIndexInput);
+        assertFalse("a metrics wrapper over a plain input must not look tiered", wrapped instanceof TieredPrefetchInput);
+        wrapped.prefetch(3L, 4L);
+        verify(plain).prefetch(3L, 4L);
 
-        TieredPrefetchInput wrapped = asInstanceOf(TieredPrefetchInput.class, StoreMetricsIndexInput.create("test", plain, metricHolder));
+        IndexInput randomAccess = mock(IndexInput.class, withSettings().extraInterfaces(RandomAccessInput.class));
+        IndexInput wrappedRandomAccess = StoreMetricsIndexInput.create("test", randomAccess, metricHolder);
+        assertTrue(wrappedRandomAccess instanceof RandomAccessInput);
+        assertFalse(wrappedRandomAccess instanceof TieredPrefetchInput);
+    }
 
-        assertEquals(TieredPrefetchInput.Outcome.SKIPPED, wrapped.ensureResident(0L, 10L));
-        assertEquals(1234L, wrapped.residencyRegionSize());
-        TieredPrefetchInput.Outcome[] outcomes = new TieredPrefetchInput.Outcome[3];
-        wrapped.ensureResident(new long[] { 0L, 100L, 200L }, 10, 2, outcomes);
-        assertEquals(TieredPrefetchInput.Outcome.SKIPPED, outcomes[0]);
-        assertEquals(TieredPrefetchInput.Outcome.SKIPPED, outcomes[1]);
-        assertNull("entries beyond count must not be written", outcomes[2]);
+    /**
+     * A slice of a tiered input may come back as a plain heap buffer, so slices and clones re-dispatch on the capability
+     * of the new delegate rather than inheriting the wrapper's. Random-access tiered delegates get a wrapper that is both.
+     */
+    public void testTieredPrefetchWrapperFollowsDelegateCapability() throws IOException {
+        PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder = new ThreadLocalDirectoryMetricHolder<>(StoreMetrics::new);
+        IndexInput tiered = mock(IndexInput.class, withSettings().extraInterfaces(TieredPrefetchInput.class));
+        IndexInput plainSlice = mock(IndexInput.class);
+        IndexInput tieredClone = mock(IndexInput.class, withSettings().extraInterfaces(TieredPrefetchInput.class));
+        when(tiered.slice("plain", 0L, 5L)).thenReturn(plainSlice);
+        when(tiered.clone()).thenReturn(tieredClone);
 
-        when(plain.length()).thenReturn(0L);
-        assertEquals("an empty input must still report a positive region size", 1L, wrapped.residencyRegionSize());
+        IndexInput wrapped = StoreMetricsIndexInput.create("test", tiered, metricHolder);
+        assertTrue(wrapped instanceof TieredPrefetchInput);
+        assertFalse("a heap slice of a tiered input is not tiered", wrapped.slice("plain", 0L, 5L) instanceof TieredPrefetchInput);
+        assertTrue("a clone of a tiered input stays tiered", wrapped.clone() instanceof TieredPrefetchInput);
+
+        IndexInput tieredRandomAccess = mock(
+            IndexInput.class,
+            withSettings().extraInterfaces(TieredPrefetchInput.class, RandomAccessInput.class)
+        );
+        IndexInput wrappedBoth = StoreMetricsIndexInput.create("test", tieredRandomAccess, metricHolder);
+        assertTrue(wrappedBoth instanceof TieredPrefetchInput);
+        assertTrue(wrappedBoth instanceof RandomAccessInput);
     }
 }

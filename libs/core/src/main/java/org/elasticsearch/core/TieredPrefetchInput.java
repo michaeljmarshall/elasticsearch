@@ -72,8 +72,12 @@ public interface TieredPrefetchInput {
      * returned outcome is the most expensive of them: any region fetching makes the whole range {@link Outcome#FETCHING},
      * and any region skipped makes it {@link Outcome#SKIPPED}.
      *
+     * <p>Like {@code IndexInput#prefetch}, this tolerates ranges that do not lie within the input: a range starting
+     * outside it, or with a non-positive length, is reported as {@link Outcome#SKIPPED} rather than rejected, since the
+     * outcome is a hint and must never fail a read.
+     *
      * @param offset the byte offset within this input
-     * @param length the number of bytes requested; must be positive and within the input
+     * @param length the number of bytes requested
      * @return the snapshot outcome for the range
      */
     Outcome ensureResident(long offset, long length) throws IOException;
@@ -85,7 +89,8 @@ public interface TieredPrefetchInput {
      * <p>Implementations group the ranges by region before touching the cache, so all ranges within one region share
      * one outcome and cost one lookup, regardless of how many ranges fall into it. The per-range result lets a caller
      * map outcomes back to its own records without knowing the region layout. Ranges that themselves span a region
-     * boundary follow the rule in {@link #ensureResident(long, long)}.
+     * boundary follow the rule in {@link #ensureResident(long, long)}, and ranges starting outside the input are reported
+     * {@link Outcome#SKIPPED}. A non-positive {@code length} is an argument error, since it applies to every range.
      *
      * @param offsets  byte offsets within this input for each range, as in {@link #ensureResident(long, long)};
      *                 only {@code [0, count)} are read

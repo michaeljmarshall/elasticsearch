@@ -66,9 +66,9 @@ public final class QueryProfiler extends AbstractProfiler<QueryProfileBreakdown,
     }
 
     /**
-     * Retrieves the tiered prefetch outcomes accumulated from the queries.
-     * TODO: these are in-memory only. Surfacing them in the profile output next to {@code vector_operations_count}
-     * requires new fields in {@link QueryProfileShardResult}, which means a transport version and XContent changes.
+     * Retrieves the tiered prefetch outcomes accumulated from the queries. The DFS profiler copies them into
+     * {@link QueryProfileShardResult} when at least one outcome was recorded, where they render as {@code tiered_prefetch}
+     * next to {@code vector_operations_count}.
      * @return tiered prefetch outcomes accumulated from the queries
      */
     public TieredPrefetchOutcomeCounts getTieredPrefetchOutcomes() {

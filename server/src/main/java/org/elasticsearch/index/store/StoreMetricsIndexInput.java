@@ -21,12 +21,11 @@ import org.elasticsearch.lucene.store.MemorySegmentAccessInputAccess;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
-import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAccessInput, TieredPrefetchInput {
+public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAccessInput {
     final PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder;
 
     public static IndexInput create(String resourceDescription, IndexInput in, PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder) {
@@ -36,11 +35,32 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
         } else if (in instanceof SelfAccountingIndexInput selfAccounting) {
             selfAccounting.accountBytesReadTo(metricHolder);
             return in;
-        } else if (in instanceof RandomAccessInput) {
-            return new RandomAccessIndexInput(resourceDescription, in, metricHolder);
         } else {
-            return new StoreMetricsIndexInput(resourceDescription, in, metricHolder);
+            return wrap(resourceDescription, in, metricHolder);
         }
+    }
+
+    /**
+     * Chooses the wrapper by the delegate's capabilities. {@link DirectAccessInput} is claimed unconditionally because its
+     * methods return {@code false} when the delegate lacks it, which callers treat as "use the plain path". The
+     * {@link TieredPrefetchInput} capability is different: callers stop issuing plain {@code prefetch} hints once they see a
+     * tiered input, and every shard directory on local storage is wrapped for metrics, so a wrapper that always claimed it
+     * would silently disable prefetch on local storage. It is therefore only claimed when the delegate has it. Slices and
+     * clones re-dispatch through here, since a slice of a tiered input may come back as a plain heap buffer.
+     */
+    private static StoreMetricsIndexInput wrap(
+        String resourceDescription,
+        IndexInput in,
+        PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder
+    ) {
+        if (in instanceof RandomAccessInput) {
+            return in instanceof TieredPrefetchInput
+                ? new TieredRandomAccessIndexInput(resourceDescription, in, metricHolder)
+                : new RandomAccessIndexInput(resourceDescription, in, metricHolder);
+        }
+        return in instanceof TieredPrefetchInput
+            ? new TieredStoreMetricsIndexInput(resourceDescription, in, metricHolder)
+            : new StoreMetricsIndexInput(resourceDescription, in, metricHolder);
     }
 
     private StoreMetricsIndexInput(String resourceDescription, IndexInput in, PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder) {
@@ -62,8 +82,8 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
         addBytesRead(len);
     }
 
-    IndexInput createCopy(String resourceDescription, IndexInput in, PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder) {
-        return new StoreMetricsIndexInput(resourceDescription, in, metricHolder);
+    final IndexInput createCopy(String resourceDescription, IndexInput in, PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder) {
+        return wrap(resourceDescription, in, metricHolder);
     }
 
     @Override
@@ -85,7 +105,7 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
     public RandomAccessInput randomAccessSlice(long offset, long length) throws IOException {
         RandomAccessInput delegate = in.randomAccessSlice(offset, length);
         if (delegate instanceof IndexInput input) {
-            return new RandomAccessIndexInput(input.toString(), input, metricHolder.singleThreaded());
+            return (RandomAccessInput) wrap(input.toString(), input, metricHolder.singleThreaded());
         } else {
             return new MetricsRandomAccessInput(delegate, metricHolder.singleThreaded());
         }
@@ -121,42 +141,6 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
     @Override
     public Optional<Boolean> isLoaded() {
         return in.isLoaded();
-    }
-
-    // TieredPrefetchInput is forwarded like DirectAccessInput: FilterIndexInput does not forward optional capabilities,
-    // so without these overrides a metrics wrapper would hide the tiered input underneath from its callers.
-
-    @Override
-    public Outcome ensureResident(long offset, long length) throws IOException {
-        if (in instanceof TieredPrefetchInput tiered) {
-            return tiered.ensureResident(offset, length);
-        }
-        return Outcome.SKIPPED;
-    }
-
-    @Override
-    public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
-        if (in instanceof TieredPrefetchInput tiered) {
-            tiered.ensureResident(offsets, length, count, outcomes);
-            return;
-        }
-        if (TieredPrefetchInput.checkBulkArgs(offsets, length, count, outcomes)) {
-            return;
-        }
-        Arrays.fill(outcomes, 0, count, Outcome.SKIPPED);
-    }
-
-    /**
-     * When the wrapped input is not tiered there is no remote tier and no region structure. Reporting the whole input as
-     * one region keeps the contract (positive, and equal offsets share a region) while telling callers there is nothing
-     * to group by. The minimum of one guards the empty-input case.
-     */
-    @Override
-    public long residencyRegionSize() {
-        if (in instanceof TieredPrefetchInput tiered) {
-            return tiered.residencyRegionSize();
-        }
-        return Math.max(1L, in.length());
     }
 
     @Override
@@ -306,11 +290,6 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
         }
 
         @Override
-        IndexInput createCopy(String resourceDescription, IndexInput in, PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder) {
-            return new RandomAccessIndexInput(resourceDescription, in, metricHolder);
-        }
-
-        @Override
         public long length() {
             return delegate.length();
         }
@@ -396,6 +375,67 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
         public void readBytes(long pos, byte[] bytes, int offset, int length) throws IOException {
             delegate.readBytes(pos, bytes, offset, length);
             metricHolder.instance().addBytesRead(length);
+        }
+    }
+
+    /**
+     * Forwards {@link TieredPrefetchInput} to a delegate that implements it. Only chosen by {@link #wrap} when the delegate
+     * has the capability, so callers never see a tiered input over local storage.
+     */
+    private static final class TieredStoreMetricsIndexInput extends StoreMetricsIndexInput implements TieredPrefetchInput {
+
+        private TieredStoreMetricsIndexInput(
+            String resourceDescription,
+            IndexInput in,
+            PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder
+        ) {
+            super(resourceDescription, in, metricHolder);
+            assert in instanceof TieredPrefetchInput;
+        }
+
+        @Override
+        public Outcome ensureResident(long offset, long length) throws IOException {
+            return ((TieredPrefetchInput) in).ensureResident(offset, length);
+        }
+
+        @Override
+        public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
+            ((TieredPrefetchInput) in).ensureResident(offsets, length, count, outcomes);
+        }
+
+        @Override
+        public long residencyRegionSize() {
+            return ((TieredPrefetchInput) in).residencyRegionSize();
+        }
+    }
+
+    /**
+     * The random-access counterpart of {@link TieredStoreMetricsIndexInput}, for delegates that are both.
+     */
+    private static final class TieredRandomAccessIndexInput extends RandomAccessIndexInput implements TieredPrefetchInput {
+
+        private TieredRandomAccessIndexInput(
+            String resourceDescription,
+            IndexInput in,
+            PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder
+        ) {
+            super(resourceDescription, in, metricHolder);
+            assert in instanceof TieredPrefetchInput;
+        }
+
+        @Override
+        public Outcome ensureResident(long offset, long length) throws IOException {
+            return ((TieredPrefetchInput) in).ensureResident(offset, length);
+        }
+
+        @Override
+        public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
+            ((TieredPrefetchInput) in).ensureResident(offsets, length, count, outcomes);
+        }
+
+        @Override
+        public long residencyRegionSize() {
+            return ((TieredPrefetchInput) in).residencyRegionSize();
         }
     }
 }

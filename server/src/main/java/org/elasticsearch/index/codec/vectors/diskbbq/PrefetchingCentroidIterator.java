@@ -29,7 +29,8 @@ import java.io.IOException;
  * {@link TieredPrefetchInput#ensureResident(long, long)} instead, and the depth adapts to the outcomes:
  * <ul>
  *     <li>{@link TieredPrefetchInput.Outcome#FETCHING}: the window doubles, up to the maximum depth, so that more
- *     remote fetches overlap with consumption.</li>
+ *     remote fetches overlap with consumption. It doubles at most once per consumed posting list, so a cold cache
+ *     widens the window as the search progresses rather than claiming the whole prefetch budget up front.</li>
  *     <li>{@link TieredPrefetchInput.Outcome#RESIDENT}: after {@link #RESIDENT_STREAK_TO_SHRINK} consecutive resident
  *     outcomes the window halves, never below the initial depth, so a warm cache does not pull centroids from the
  *     delegate far beyond what the caller will consume.</li>
@@ -66,6 +67,8 @@ public final class PrefetchingCentroidIterator implements CentroidIterator {
     private int window;
     // Consecutive RESIDENT outcomes since the last window change or non-resident outcome
     private int residentStreak = 0;
+    // Whether the window has already doubled since the caller last consumed a posting list
+    private boolean grownSinceLastConsume = false;
 
     // Ring buffer for prefetched offsets and lengths
     private final PostingMetadata[] prefetchBuffer;
@@ -160,7 +163,13 @@ public final class PrefetchingCentroidIterator implements CentroidIterator {
         switch (outcome) {
             case FETCHING -> {
                 residentStreak = 0;
-                window = Math.min(window * 2, maxPrefetchAhead);
+                // Grow at most once per consumed posting list. Growing on every FETCHING outcome while filling would let a
+                // cold cache jump straight to the cap before anything is consumed, taking that many budget slots from the
+                // node-wide prefetch budget that the rescore phase of the same search also needs.
+                if (grownSinceLastConsume == false) {
+                    grownSinceLastConsume = true;
+                    window = Math.min(window * 2, maxPrefetchAhead);
+                }
             }
             case RESIDENT -> {
                 if (++residentStreak >= RESIDENT_STREAK_TO_SHRINK) {
@@ -194,7 +203,8 @@ public final class PrefetchingCentroidIterator implements CentroidIterator {
         readIndex = (readIndex + 1) % prefetchBuffer.length;
         bufferCount--;
 
-        // Refill the buffer to the current window
+        // Refill the buffer to the current window; the window may double once more during this refill
+        grownSinceLastConsume = false;
         fillBuffer();
 
         return result;

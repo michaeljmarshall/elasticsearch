@@ -1561,10 +1561,23 @@ public class BlobCacheIndexInputTests extends ESIndexInputTestCase {
         verify(cacheFile).tryPrefetch(sliceOffset + first, second + recordLength - first);
         assertThat("the caller's offsets must not be mutated", offsets[0], equalTo(first));
 
-        // ranges outside the slice are rejected in the caller's terms, before any translation
-        expectThrows(IllegalArgumentException.class, () -> slice.ensureResident(sliceLength - 1, 2));
-        expectThrows(IllegalArgumentException.class, () -> slice.ensureResident(-1, 1));
-        expectThrows(IllegalArgumentException.class, () -> slice.ensureResident(new long[] { sliceLength }, 1, 1, outcomes));
+        // like prefetch, ranges that do not lie within the slice are tolerated rather than rejected: a range running past
+        // the end is clamped to the slice, and a range starting outside it is SKIPPED without touching the cache
+        clearInvocations(cacheFile);
+        assertThat(slice.ensureResident(sliceLength - 1, 2), equalTo(TieredPrefetchInput.Outcome.RESIDENT));
+        verify(cacheFile).tryPrefetch(sliceOffset + sliceLength - 1, 1);
+        clearInvocations(cacheFile);
+        assertThat(slice.ensureResident(-1, 1), equalTo(TieredPrefetchInput.Outcome.SKIPPED));
+        assertThat(slice.ensureResident(sliceLength, 1), equalTo(TieredPrefetchInput.Outcome.SKIPPED));
+        assertThat(slice.ensureResident(0, 0), equalTo(TieredPrefetchInput.Outcome.SKIPPED));
+        verifyNoInteractions(cacheFile);
+        // bulk: a record starting outside the slice is SKIPPED while the others are still looked up at translated offsets
+        TieredPrefetchInput.Outcome[] mixedOutcomes = new TieredPrefetchInput.Outcome[3];
+        slice.ensureResident(new long[] { first, sliceLength, -1L }, recordLength, 3, mixedOutcomes);
+        assertThat(mixedOutcomes[0], equalTo(TieredPrefetchInput.Outcome.RESIDENT));
+        assertThat(mixedOutcomes[1], equalTo(TieredPrefetchInput.Outcome.SKIPPED));
+        assertThat(mixedOutcomes[2], equalTo(TieredPrefetchInput.Outcome.SKIPPED));
+        verify(cacheFile).tryPrefetch(sliceOffset + first, recordLength);
         // a zero count is a no-op
         clearInvocations(cacheFile);
         slice.ensureResident(new long[0], 1, 0, new TieredPrefetchInput.Outcome[0]);

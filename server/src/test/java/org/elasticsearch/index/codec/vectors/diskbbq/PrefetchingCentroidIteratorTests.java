@@ -12,6 +12,9 @@ package org.elasticsearch.index.codec.vectors.diskbbq;
 import org.apache.lucene.store.IndexInput;
 import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.core.TieredPrefetchInput.Outcome;
+import org.elasticsearch.index.store.StoreMetrics;
+import org.elasticsearch.index.store.StoreMetricsIndexInput;
+import org.elasticsearch.index.store.ThreadLocalDirectoryMetricHolder;
 import org.elasticsearch.test.ESTestCase;
 
 import java.io.IOException;
@@ -71,8 +74,9 @@ public class PrefetchingCentroidIteratorTests extends ESTestCase {
     }
 
     /**
-     * Every {@code FETCHING} outcome doubles the window, so a cold remote cache reaches the cap while the buffer is
-     * first filled, and the window never exceeds it.
+     * {@code FETCHING} outcomes double the window, but at most once per consumed posting list, so a cold remote cache
+     * widens the window as the search progresses rather than claiming the whole prefetch budget during the initial fill.
+     * The window never exceeds the cap.
      */
     public void testWindowGrowsOnFetchingUpToCap() throws IOException {
         int numPostings = 100;
@@ -81,15 +85,20 @@ public class PrefetchingCentroidIteratorTests extends ESTestCase {
         TieredRecordingIndexInput input = new TieredRecordingIndexInput(i -> Outcome.FETCHING);
 
         PrefetchingCentroidIterator iterator = new PrefetchingCentroidIterator(new ListCentroidIterator(postings), input);
-        assertThat(iterator.window(), equalTo(cap));
-        assertThat(input.requested.size(), equalTo(cap));
+        // the initial fill may grow once: 1 -> 2
+        assertThat(iterator.window(), equalTo(2));
+        assertThat(input.requested.size(), equalTo(2));
 
         List<PostingMetadata> consumed = new ArrayList<>();
+        int expectedWindow = 2;
         while (iterator.hasNext()) {
             consumed.add(iterator.nextPosting());
-            assertThat(iterator.window(), equalTo(cap));
-            assertThat(input.requested.size(), equalTo(Math.min(cap + consumed.size(), numPostings)));
+            // each consumed posting list allows one more doubling until the cap: 4, 8, 16, 16, ...
+            expectedWindow = Math.min(cap, expectedWindow * 2);
+            assertThat(iterator.window(), equalTo(expectedWindow));
+            assertThat(input.requested.size(), equalTo(Math.min(consumed.size() + expectedWindow, numPostings)));
         }
+        assertThat(iterator.window(), equalTo(cap));
         assertThat(consumed, equalTo(postings));
         assertThat(input.requested, equalTo(offsets(postings)));
         assertThat(input.prefetchCalls, equalTo(0));
@@ -102,11 +111,23 @@ public class PrefetchingCentroidIteratorTests extends ESTestCase {
         List<PostingMetadata> postings = postings(30);
         TieredRecordingIndexInput input = new TieredRecordingIndexInput(i -> i < 3 ? Outcome.FETCHING : Outcome.RESIDENT);
         PrefetchingCentroidIterator iterator = new PrefetchingCentroidIterator(new ListCentroidIterator(postings), input, 1, 64);
-        // Requests 0..2 are FETCHING: 1 -> 2 -> 4 -> 8. Requests 3..6 are RESIDENT: the fourth halves 8 -> 4, at which
-        // point the buffer (7 entries) is already above the window and filling stops.
-        assertThat(input.requested.size(), equalTo(7));
+        // Initial fill: request 0 is FETCHING and grows 1 -> 2; request 1 is FETCHING but the window already grew.
+        assertThat(input.requested.size(), equalTo(2));
+        assertThat(iterator.window(), equalTo(2));
+        // First consumption: request 2 is FETCHING and grows 2 -> 4; requests 3 and 4 are RESIDENT and fill to 4.
+        iterator.nextPosting();
+        assertThat(input.requested.size(), equalTo(5));
         assertThat(iterator.window(), equalTo(4));
-        assertThat(drain(iterator), equalTo(postings));
+        // Second consumption: request 5 is RESIDENT (third in a row) and refills the buffer to 4.
+        iterator.nextPosting();
+        assertThat(input.requested.size(), equalTo(6));
+        assertThat(iterator.window(), equalTo(4));
+        // Third consumption: request 6 is the fourth RESIDENT in a row and halves 4 -> 2; the buffer is above the window
+        // so filling stops.
+        iterator.nextPosting();
+        assertThat(input.requested.size(), equalTo(7));
+        assertThat(iterator.window(), equalTo(2));
+        assertThat(drain(iterator), equalTo(postings.subList(3, postings.size())));
         assertThat(input.requested, equalTo(offsets(postings)));
     }
 
@@ -121,10 +142,10 @@ public class PrefetchingCentroidIteratorTests extends ESTestCase {
         TieredRecordingIndexInput input = new TieredRecordingIndexInput(i -> i < 3 ? Outcome.FETCHING : Outcome.RESIDENT);
         PrefetchingCentroidIterator iterator = new PrefetchingCentroidIterator(new ListCentroidIterator(postings), input, initial, cap);
 
-        // Requests 0..2 grow 2 -> 4 -> 8 -> 16; requests 3..6 are resident and halve it to 8; request 7 fills the
-        // buffer to the new window.
-        assertThat(input.requested.size(), equalTo(8));
-        assertThat(iterator.window(), equalTo(8));
+        // The initial fill grows once, 2 -> 4, on request 0; requests 1 and 2 are FETCHING but cannot grow again until
+        // something is consumed; request 3 is RESIDENT and completes the buffer.
+        assertThat(input.requested.size(), equalTo(4));
+        assertThat(iterator.window(), equalTo(4));
 
         List<PostingMetadata> consumed = new ArrayList<>();
         int previousWindow = iterator.window();
@@ -133,7 +154,7 @@ public class PrefetchingCentroidIteratorTests extends ESTestCase {
             int window = iterator.window();
             assertThat("window only shrinks once all outcomes are resident", window, lessThanOrEqualTo(previousWindow));
             assertThat(window, greaterThanOrEqualTo(initial));
-            assertThat("buffer never exceeds the largest window", input.requested.size() - consumed.size(), lessThanOrEqualTo(8));
+            assertThat("buffer never exceeds the largest window", input.requested.size() - consumed.size(), lessThanOrEqualTo(4));
             previousWindow = window;
         }
         assertThat(iterator.window(), equalTo(initial));
@@ -205,6 +226,24 @@ public class PrefetchingCentroidIteratorTests extends ESTestCase {
         }
         assertThat(consumed, equalTo(postings));
         assertThat(input.requested, equalTo(offsets(postings)));
+    }
+
+    /**
+     * On local storage every shard directory wraps its inputs for metrics. That wrapper must not make a plain input look
+     * tiered, or the iterator would take the tiered path, see nothing but {@code SKIPPED}, and never issue the
+     * {@code prefetch} hint it issued before. Here the recording input is wrapped exactly as a stateful store would wrap it.
+     */
+    public void testFallbackThroughStoreMetricsWrapper() throws IOException {
+        int depth = randomIntBetween(1, 4);
+        List<PostingMetadata> postings = postings(20);
+        RecordingIndexInput input = new RecordingIndexInput();
+        IndexInput wrapped = StoreMetricsIndexInput.create("wrapped", input, new ThreadLocalDirectoryMetricHolder<>(StoreMetrics::new));
+        assertFalse("a metrics wrapper over a plain input must not look tiered", wrapped instanceof TieredPrefetchInput);
+
+        PrefetchingCentroidIterator iterator = new PrefetchingCentroidIterator(new ListCentroidIterator(postings), wrapped, depth);
+        assertThat(input.prefetchCalls, equalTo(depth));
+        assertThat(drain(iterator), equalTo(postings));
+        assertThat("every posting list must have been hinted through the wrapper", input.prefetchCalls, equalTo(postings.size()));
     }
 
     /**

@@ -515,7 +515,27 @@ public class CacheFileReader {
         }
         final PrefetchBudget.RegionKey key = new PrefetchBudget.RegionKey(cacheFile.getCacheKey(), region);
         return switch (prefetchBudget.tryAcquire(key)) {
-            case JOINED -> Outcome.FETCHING;
+            case JOINED -> {
+                // Some fetch for this region is already in flight under the budget, but it may cover a different sub-range:
+                // the blob reader's range can be smaller than a region (e.g. the chunk size used when reading from an
+                // indexing node). Populate the requested bytes anyway; the cache joins any gap that is already claimed, so
+                // this never downloads the same bytes twice. No slot was taken, so nothing is released or counted here.
+                try {
+                    populateForPrefetch(range, 0, ActionListener.wrap(v -> {}, e -> {
+                        logger.debug(
+                            () -> "ensureResident fetch failed for joined [" + cacheFile.getCacheKey() + "] region [" + region + "]",
+                            e
+                        );
+                    }));
+                } catch (Exception e) {
+                    logger.debug(
+                        () -> "ensureResident could not join fetch for [" + cacheFile.getCacheKey() + "] region [" + region + "]",
+                        e
+                    );
+                    yield Outcome.SKIPPED;
+                }
+                yield Outcome.FETCHING;
+            }
             case DENIED -> {
                 blobCacheMetrics.recordPrefetch(PrefetchResult.Skipped);
                 yield Outcome.SKIPPED;

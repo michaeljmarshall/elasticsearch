@@ -217,26 +217,35 @@ public final class BlobCacheIndexInput extends BlobCacheBufferedIndexInput
         cacheFileReader.tryPrefetch(this.offset + offset, length);
     }
 
+    /**
+     * Like {@link #prefetch}, tolerates ranges that do not lie within this input rather than rejecting them: outcomes are
+     * hints and must never fail a read. A range starting outside the input has nothing to make resident and is
+     * {@link Outcome#SKIPPED}; a range running past the end is clamped to the input.
+     */
     @Override
     public Outcome ensureResident(long offset, long length) throws IOException {
-        ensureWithinInput(offset, length);
-        return cacheFileReader.ensureResident(this.offset + offset, length);
+        if (startsOutsideInput(offset) || length <= 0) {
+            return Outcome.SKIPPED;
+        }
+        return cacheFileReader.ensureResident(this.offset + offset, Math.min(length, length() - offset));
     }
 
+    /**
+     * Bulk form. Ranges starting outside the input are reported {@link Outcome#SKIPPED}; ranges running past the end are
+     * passed through, as {@link #prefetch} would, since the bytes beyond it belong to the same blob and the reader clamps
+     * to the blob.
+     */
     @Override
     public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
         if (TieredPrefetchInput.checkBulkArgs(offsets, length, count, outcomes)) {
             return;
         }
-        // validate against this input's bounds before translating, so a bad offset is reported in the caller's terms
-        for (int i = 0; i < count; i++) {
-            ensureWithinInput(offsets[i], length);
-        }
         long[] adjusted = offsets;
-        if (this.offset != 0) {
+        if (this.offset != 0 || anyStartsOutsideInput(offsets, count)) {
             adjusted = new long[count];
             for (int i = 0; i < count; i++) {
-                adjusted[i] = offsets[i] + this.offset;
+                // a negative offset makes the reader report the range as SKIPPED without touching the cache
+                adjusted[i] = startsOutsideInput(offsets[i]) ? -1L : offsets[i] + this.offset;
             }
         }
         cacheFileReader.ensureResident(adjusted, length, count, outcomes);
@@ -247,12 +256,17 @@ public final class BlobCacheIndexInput extends BlobCacheBufferedIndexInput
         return cacheFileReader.residencyRegionSize();
     }
 
-    private void ensureWithinInput(long offset, long length) {
-        if (offset < 0 || length <= 0 || offset + length > length()) {
-            throw new IllegalArgumentException(
-                "range [" + offset + ", " + (offset + length) + ") is not within " + super.toString() + " of length " + length()
-            );
+    private boolean startsOutsideInput(long offset) {
+        return offset < 0 || offset >= length();
+    }
+
+    private boolean anyStartsOutsideInput(long[] offsets, int count) {
+        for (int i = 0; i < count; i++) {
+            if (startsOutsideInput(offsets[i])) {
+                return true;
+            }
         }
+        return false;
     }
 
     @Override
