@@ -47,6 +47,7 @@ import org.elasticsearch.search.profile.SearchProfileShardResult;
 import org.elasticsearch.search.profile.aggregation.AggregationProfileShardResult;
 import org.elasticsearch.search.profile.query.CollectorResult;
 import org.elasticsearch.search.profile.query.QueryProfileShardResult;
+import org.elasticsearch.search.profile.query.TieredPrefetchOutcomeCounts;
 import org.elasticsearch.search.suggest.Suggest;
 import org.elasticsearch.test.rest.ESRestTestCase;
 import org.elasticsearch.transport.RemoteClusterAware;
@@ -687,6 +688,7 @@ public enum SearchResponseUtils {
         List<ProfileResult> queryProfileResults = new ArrayList<>();
         long rewriteTime = 0;
         Long vectorOperationsCount = null;
+        TieredPrefetchOutcomeCounts tieredPrefetchOutcomes = null;
         CollectorResult collector = null;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
             if (token == XContentParser.Token.FIELD_NAME) {
@@ -696,6 +698,12 @@ public enum SearchResponseUtils {
                     rewriteTime = parser.longValue();
                 } else if (QueryProfileShardResult.VECTOR_OPERATIONS_COUNT.equals(currentFieldName)) {
                     vectorOperationsCount = parser.longValue();
+                } else {
+                    parser.skipChildren();
+                }
+            } else if (token == XContentParser.Token.START_OBJECT) {
+                if (QueryProfileShardResult.TIERED_PREFETCH.equals(currentFieldName)) {
+                    tieredPrefetchOutcomes = TieredPrefetchOutcomeCounts.fromXContent(parser);
                 } else {
                     parser.skipChildren();
                 }
@@ -715,7 +723,7 @@ public enum SearchResponseUtils {
                 parser.skipChildren();
             }
         }
-        return new QueryProfileShardResult(queryProfileResults, rewriteTime, collector, vectorOperationsCount);
+        return new QueryProfileShardResult(queryProfileResults, rewriteTime, collector, vectorOperationsCount, tieredPrefetchOutcomes);
     }
 
     /**

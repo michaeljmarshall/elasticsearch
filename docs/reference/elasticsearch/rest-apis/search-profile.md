@@ -1108,7 +1108,7 @@ One of the `dfs.knn` sections for a shard looks like the following:
 ```
 % TESTRESPONSE[skip:response format changes in 130254]
 
-In the `dfs.knn` portion of the response we can see the output the of timings for [query](search-profile.md#query-section), [rewrite](search-profile.md#rewrite-section), and [collector](search-profile.md#collectors-section). Unlike many other queries, kNN search does the bulk of the work during the query rewrite. This means `rewrite_time` represents the time spent on kNN search. The attribute `vector_operations_count` represents the overall count of vector operations performed during the kNN search.
+In the `dfs.knn` portion of the response we can see the output the of timings for [query](search-profile.md#query-section), [rewrite](search-profile.md#rewrite-section), and [collector](search-profile.md#collectors-section). Unlike many other queries, kNN search does the bulk of the work during the query rewrite. This means `rewrite_time` represents the time spent on kNN search. The attribute `vector_operations_count` represents the overall count of vector operations performed during the kNN search. When the index is stored in an object store behind a local cache, a `tiered_prefetch` object may also appear with `resident`, `fetching` and `skipped` counts. These tally the vector data ranges the kNN search asked to have made resident before reading them: `resident` ranges were already in the local cache, `fetching` ranges had to be fetched from the object store, and `skipped` ranges could not be fetched ahead of time because the node's prefetch budget was exhausted. The object is absent when the search did not read through such a cache.
 
 
 

@@ -15,6 +15,7 @@ import org.elasticsearch.search.profile.SearchProfileDfsPhaseResult;
 import org.elasticsearch.search.profile.Timer;
 import org.elasticsearch.search.profile.query.QueryProfileShardResult;
 import org.elasticsearch.search.profile.query.QueryProfiler;
+import org.elasticsearch.search.profile.query.TieredPrefetchOutcomeCounts;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -68,12 +69,18 @@ public class DfsProfiler extends AbstractProfileBreakdown<DfsTimingType> {
         if (knnQueryProfilers.size() > 0) {
             final List<QueryProfileShardResult> queryProfileShardResult = new ArrayList<>(knnQueryProfilers.size());
             for (QueryProfiler queryProfiler : knnQueryProfilers) {
+                // Only report tiered prefetch outcomes when the query actually read through a tiered input, so the
+                // profile output of nodes without tiered storage is unchanged.
+                TieredPrefetchOutcomeCounts tieredPrefetchOutcomes = queryProfiler.getTieredPrefetchOutcomes().isEmpty()
+                    ? null
+                    : queryProfiler.getTieredPrefetchOutcomes().copy();
                 queryProfileShardResult.add(
                     new QueryProfileShardResult(
                         queryProfiler.getTree(),
                         queryProfiler.getRewriteTime(),
                         queryProfiler.getCollectorResult(),
-                        queryProfiler.getVectorOpsCount()
+                        queryProfiler.getVectorOpsCount(),
+                        tieredPrefetchOutcomes
                     )
                 );
             }

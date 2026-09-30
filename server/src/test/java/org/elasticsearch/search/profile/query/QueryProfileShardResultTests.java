@@ -37,7 +37,14 @@ public class QueryProfileShardResultTests extends AbstractXContentSerializingTes
         }
 
         Long vectorOperationsCount = randomBoolean() ? null : randomNonNegativeLong();
-        return new QueryProfileShardResult(queryProfileResults, rewriteTime, profileCollector, vectorOperationsCount);
+        TieredPrefetchOutcomeCounts tieredPrefetchOutcomes = randomBoolean() ? null : TieredPrefetchOutcomeCountsTests.createTestItem();
+        return new QueryProfileShardResult(
+            queryProfileResults,
+            rewriteTime,
+            profileCollector,
+            vectorOperationsCount,
+            tieredPrefetchOutcomes
+        );
     }
 
     @Override
