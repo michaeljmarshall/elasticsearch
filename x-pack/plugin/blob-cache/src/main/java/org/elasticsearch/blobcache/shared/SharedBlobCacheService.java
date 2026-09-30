@@ -1647,6 +1647,14 @@ public class SharedBlobCacheService<KeyType extends SharedBlobCacheService.KeyBa
             return cacheKey;
         }
 
+        /**
+         * The region size of the owning cache, which is the granularity at which this file tracks residency and fetches
+         * from its source. Exposed so callers that group scattered reads by region do not need the service itself.
+         */
+        public int getRegionSize() {
+            return SharedBlobCacheService.this.getRegionSize();
+        }
+
         public boolean tryPrefetch(long offset, long length) throws IOException {
             assert assertOffsetsWithinFileLength(offset, length, this.length);
             final int startRegion = getRegion(offset);

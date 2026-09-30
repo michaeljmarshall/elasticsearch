@@ -32,6 +32,7 @@ import org.elasticsearch.core.Nullable;
 import org.elasticsearch.core.RefCounted;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Strings;
+import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.index.shard.ShardId;
 import org.elasticsearch.index.store.ByteSizeDirectory;
 import org.elasticsearch.index.store.LuceneFilesExtensions;
@@ -768,7 +769,11 @@ public class IndexDirectory extends ByteSizeDirectory {
      * exposed through {@link DirectAccessInput}, whose segments are scoped to a single callback, rather than through Lucene's
      * {@link MemorySegmentAccessInput}, whose segments must remain valid until the input is closed.
      */
-    class ReopeningIndexInput extends BlobCacheBufferedIndexInput implements DirectAccessInput, SelfAccountingIndexInput {
+    class ReopeningIndexInput extends BlobCacheBufferedIndexInput
+        implements
+            DirectAccessInput,
+            SelfAccountingIndexInput,
+            TieredPrefetchInput {
 
         private final String name;
         private final IOContext context;
@@ -1241,6 +1246,50 @@ public class IndexDirectory extends ByteSizeDirectory {
                 }
                 return false;
             });
+        }
+
+        /**
+         * While the file is still local (not yet uploaded, read from disk) every byte is in the local tier, so the honest
+         * answer is {@link Outcome#RESIDENT}: nothing needs fetching and the caller should not deepen its window. Once the
+         * input has been reopened from the cache, the request is forwarded to the {@link BlobCacheIndexInput} underneath.
+         * This adds no object-store fetching on the indexing tier beyond what the cached input already does.
+         */
+        @Override
+        public Outcome ensureResident(long offset, long length) throws IOException {
+            return executeLocallyOrReopen(current -> {
+                IndexInput inner = current.getDelegate();
+                assert FilterIndexInput.unwrap(inner) == inner : "unexpected wrapper: getDelegate() should be the innermost input";
+                if (inner instanceof TieredPrefetchInput tiered) {
+                    return tiered.ensureResident(offset, length);
+                }
+                return current.isCached() ? Outcome.SKIPPED : Outcome.RESIDENT;
+            });
+        }
+
+        @Override
+        public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
+            if (TieredPrefetchInput.checkBulkArgs(offsets, length, count, outcomes)) {
+                return;
+            }
+            executeLocallyOrReopen(current -> {
+                IndexInput inner = current.getDelegate();
+                assert FilterIndexInput.unwrap(inner) == inner : "unexpected wrapper: getDelegate() should be the innermost input";
+                if (inner instanceof TieredPrefetchInput tiered) {
+                    tiered.ensureResident(offsets, length, count, outcomes);
+                } else {
+                    Arrays.fill(outcomes, 0, count, current.isCached() ? Outcome.SKIPPED : Outcome.RESIDENT);
+                }
+                return null;
+            });
+        }
+
+        /**
+         * The region size is a property of the node's cache, not of where this input currently reads from, so it is the
+         * same before and after the file is reopened from the cache.
+         */
+        @Override
+        public long residencyRegionSize() {
+            return cacheDirectory.getCacheService().getRegionSize();
         }
 
         private synchronized Delegate reopenInputFromCache() throws IOException {

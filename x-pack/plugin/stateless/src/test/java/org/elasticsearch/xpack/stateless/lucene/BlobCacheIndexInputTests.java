@@ -31,6 +31,7 @@ import org.elasticsearch.common.unit.ByteSizeUnit;
 import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.concurrent.DeterministicTaskQueue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.env.Environment;
 import org.elasticsearch.env.NodeEnvironment;
 import org.elasticsearch.env.TestEnvironment;
@@ -1505,6 +1506,69 @@ public class BlobCacheIndexInputTests extends ESIndexInputTestCase {
         long slicePrefetchLength = randomLongBetween(1, sliceLength - slicePrefetchOffset);
         slice.prefetch(slicePrefetchOffset, slicePrefetchLength);
         verify(cacheFile).tryPrefetch(sliceOffset + slicePrefetchOffset, slicePrefetchLength);
+    }
+
+    // Verifies that ensureResident on a sliced BlobCacheIndexInput translates offsets by this.offset, in both the single
+    // and the bulk form, and that ranges outside the input are rejected before reaching the reader. Uses a mock CacheFile
+    // for the same reason as testPrefetchOnSlice: it is the only way to capture the offsets the reader actually asks for.
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    public void testEnsureResidentOnSlice() throws IOException {
+        final SharedBlobCacheService.CacheFile cacheFile = mock(SharedBlobCacheService.CacheFile.class);
+        when(cacheFile.copy()).thenReturn(cacheFile);
+        when(cacheFile.tryPrefetch(anyLong(), anyLong())).thenReturn(true);
+        final long fileLength = randomLongBetween(200, 10_000);
+        when(cacheFile.getLength()).thenReturn(fileLength);
+        // one region covers the whole file so every request maps to a single region and its offsets pass through unchanged
+        when(cacheFile.getRegionSize()).thenReturn(Math.toIntExact(fileLength) * 2);
+        final CacheFileReader cacheFileReader = new CacheFileReader(
+            cacheFile,
+            mock(CacheBlobReader.class),
+            createBlobFileRanges(randomNonNegativeLong(), 0L, 0, (int) fileLength),
+            BlobCacheMetrics.NOOP,
+            System::currentTimeMillis,
+            true
+        );
+        final BlobCacheIndexInput indexInput = new BlobCacheIndexInput(
+            "test-file",
+            randomIOContext(),
+            cacheFileReader,
+            null,
+            fileLength,
+            0
+        );
+        assertThat(indexInput.residencyRegionSize(), equalTo(fileLength * 2));
+
+        long sliceOffset = randomLongBetween(1, fileLength / 2);
+        long sliceLength = randomLongBetween(4, fileLength - sliceOffset);
+        BlobCacheIndexInput slice = asInstanceOf(BlobCacheIndexInput.class, indexInput.doSlice("test-slice", sliceOffset, sliceLength));
+
+        long offset = randomLongBetween(0, sliceLength - 2);
+        long length = randomLongBetween(1, sliceLength - offset);
+        assertThat(slice.ensureResident(offset, length), equalTo(TieredPrefetchInput.Outcome.RESIDENT));
+        verify(cacheFile).tryPrefetch(sliceOffset + offset, length);
+
+        // bulk: two records in the same region are coalesced into one lookup over their union, at translated offsets
+        clearInvocations(cacheFile);
+        int recordLength = Math.toIntExact(randomLongBetween(1, sliceLength / 4));
+        long first = randomLongBetween(0, sliceLength / 2 - recordLength);
+        long second = randomLongBetween(sliceLength / 2, sliceLength - recordLength);
+        long[] offsets = new long[] { first, second, Long.MIN_VALUE }; // trailing entry beyond count is never read
+        TieredPrefetchInput.Outcome[] outcomes = new TieredPrefetchInput.Outcome[3];
+        slice.ensureResident(offsets, recordLength, 2, outcomes);
+        assertThat(outcomes[0], equalTo(TieredPrefetchInput.Outcome.RESIDENT));
+        assertThat(outcomes[1], equalTo(TieredPrefetchInput.Outcome.RESIDENT));
+        assertNull(outcomes[2]);
+        verify(cacheFile).tryPrefetch(sliceOffset + first, second + recordLength - first);
+        assertThat("the caller's offsets must not be mutated", offsets[0], equalTo(first));
+
+        // ranges outside the slice are rejected in the caller's terms, before any translation
+        expectThrows(IllegalArgumentException.class, () -> slice.ensureResident(sliceLength - 1, 2));
+        expectThrows(IllegalArgumentException.class, () -> slice.ensureResident(-1, 1));
+        expectThrows(IllegalArgumentException.class, () -> slice.ensureResident(new long[] { sliceLength }, 1, 1, outcomes));
+        // a zero count is a no-op
+        clearInvocations(cacheFile);
+        slice.ensureResident(new long[0], 1, 0, new TieredPrefetchInput.Outcome[0]);
+        verifyNoInteractions(cacheFile);
     }
 
     @SuppressWarnings({ "unchecked", "rawtypes" })

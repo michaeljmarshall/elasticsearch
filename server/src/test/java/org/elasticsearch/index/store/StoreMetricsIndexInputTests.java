@@ -13,6 +13,7 @@ import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.DirectAccessInput;
+import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.test.ESTestCase;
 import org.hamcrest.Matchers;
 
@@ -267,5 +268,52 @@ public class StoreMetricsIndexInputTests extends ESTestCase {
                 addrs -> fail("action should not be called")
             )
         );
+    }
+
+    /**
+     * The wrapper must forward the tiered-prefetch capability of the input underneath, as it does for direct access,
+     * because {@code FilterIndexInput} forwards neither. The delegate is a mock with the extra interface: there is no
+     * tiered input in server to wrap, and the test only checks that calls and results pass through untouched.
+     */
+    public void testTieredPrefetchIsForwarded() throws IOException {
+        PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder = new ThreadLocalDirectoryMetricHolder<>(StoreMetrics::new);
+        IndexInput tiered = mock(IndexInput.class, withSettings().extraInterfaces(TieredPrefetchInput.class));
+        TieredPrefetchInput asTiered = (TieredPrefetchInput) tiered;
+        when(asTiered.ensureResident(10L, 5L)).thenReturn(TieredPrefetchInput.Outcome.FETCHING);
+        when(asTiered.residencyRegionSize()).thenReturn(4096L);
+        long[] offsets = new long[] { 1L, 2L };
+        TieredPrefetchInput.Outcome[] outcomes = new TieredPrefetchInput.Outcome[2];
+
+        IndexInput wrapped = StoreMetricsIndexInput.create("test", tiered, metricHolder);
+        TieredPrefetchInput wrappedTiered = asInstanceOf(TieredPrefetchInput.class, wrapped);
+
+        assertEquals(TieredPrefetchInput.Outcome.FETCHING, wrappedTiered.ensureResident(10L, 5L));
+        assertEquals(4096L, wrappedTiered.residencyRegionSize());
+        wrappedTiered.ensureResident(offsets, 3, 2, outcomes);
+        verify(asTiered).ensureResident(offsets, 3, 2, outcomes);
+        assertEquals(0, metricHolder.instance().getBytesRead());
+    }
+
+    /**
+     * Over a plain input there is no remote tier: every range is reported skipped, and the whole input counts as one
+     * region so callers have nothing to group by.
+     */
+    public void testTieredPrefetchOverPlainInput() throws IOException {
+        PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder = new ThreadLocalDirectoryMetricHolder<>(StoreMetrics::new);
+        IndexInput plain = mock(IndexInput.class);
+        when(plain.length()).thenReturn(1234L);
+
+        TieredPrefetchInput wrapped = asInstanceOf(TieredPrefetchInput.class, StoreMetricsIndexInput.create("test", plain, metricHolder));
+
+        assertEquals(TieredPrefetchInput.Outcome.SKIPPED, wrapped.ensureResident(0L, 10L));
+        assertEquals(1234L, wrapped.residencyRegionSize());
+        TieredPrefetchInput.Outcome[] outcomes = new TieredPrefetchInput.Outcome[3];
+        wrapped.ensureResident(new long[] { 0L, 100L, 200L }, 10, 2, outcomes);
+        assertEquals(TieredPrefetchInput.Outcome.SKIPPED, outcomes[0]);
+        assertEquals(TieredPrefetchInput.Outcome.SKIPPED, outcomes[1]);
+        assertNull("entries beyond count must not be written", outcomes[2]);
+
+        when(plain.length()).thenReturn(0L);
+        assertEquals("an empty input must still report a positive region size", 1L, wrapped.residencyRegionSize());
     }
 }

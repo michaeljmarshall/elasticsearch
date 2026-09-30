@@ -16,15 +16,17 @@ import org.apache.lucene.store.MemorySegmentAccessInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.DirectAccessInput;
+import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.lucene.store.MemorySegmentAccessInputAccess;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAccessInput {
+public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAccessInput, TieredPrefetchInput {
     final PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder;
 
     public static IndexInput create(String resourceDescription, IndexInput in, PluggableDirectoryMetricsHolder<StoreMetrics> metricHolder) {
@@ -119,6 +121,42 @@ public class StoreMetricsIndexInput extends FilterIndexInput implements DirectAc
     @Override
     public Optional<Boolean> isLoaded() {
         return in.isLoaded();
+    }
+
+    // TieredPrefetchInput is forwarded like DirectAccessInput: FilterIndexInput does not forward optional capabilities,
+    // so without these overrides a metrics wrapper would hide the tiered input underneath from its callers.
+
+    @Override
+    public Outcome ensureResident(long offset, long length) throws IOException {
+        if (in instanceof TieredPrefetchInput tiered) {
+            return tiered.ensureResident(offset, length);
+        }
+        return Outcome.SKIPPED;
+    }
+
+    @Override
+    public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
+        if (in instanceof TieredPrefetchInput tiered) {
+            tiered.ensureResident(offsets, length, count, outcomes);
+            return;
+        }
+        if (TieredPrefetchInput.checkBulkArgs(offsets, length, count, outcomes)) {
+            return;
+        }
+        Arrays.fill(outcomes, 0, count, Outcome.SKIPPED);
+    }
+
+    /**
+     * When the wrapped input is not tiered there is no remote tier and no region structure. Reporting the whole input as
+     * one region keeps the contract (positive, and equal offsets share a region) while telling callers there is nothing
+     * to group by. The minimum of one guards the empty-input case.
+     */
+    @Override
+    public long residencyRegionSize() {
+        if (in instanceof TieredPrefetchInput tiered) {
+            return tiered.residencyRegionSize();
+        }
+        return Math.max(1L, in.length());
     }
 
     @Override

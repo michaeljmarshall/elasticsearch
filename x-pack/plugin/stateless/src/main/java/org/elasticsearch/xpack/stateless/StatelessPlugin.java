@@ -1520,6 +1520,7 @@ public class StatelessPlugin extends Plugin
             StatelessSharedBlobCacheService.STATELESS_CACHE_EVICTION_POLICY_DEGRADATION_THRESHOLD_SETTING,
             StatelessSharedBlobCacheService.STATELESS_CACHE_EVICTION_POLICY_DEGRADATION_DURATION_SETTING,
             StatelessSharedBlobCacheService.STATELESS_CACHE_OBJECT_STORE_PREFETCH_ENABLED_SETTING,
+            StatelessSharedBlobCacheService.STATELESS_CACHE_OBJECT_STORE_PREFETCH_MAX_IN_FLIGHT_REGIONS_SETTING,
             DisableSimulationRebalancingDecider.SIMULATION_REBALANCING_ENABLED_SETTING,
             UploadQueueControllerService.STATELESS_UPLOAD_QUEUE_CONTROLLER_ENABLED,
             UploadQueueControllerService.STATELESS_UPLOAD_QUEUE_CONTROLLER_INDEXING_THROTTLING_ENABLED,

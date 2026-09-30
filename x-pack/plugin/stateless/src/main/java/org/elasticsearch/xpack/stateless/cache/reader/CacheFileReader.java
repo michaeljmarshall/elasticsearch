@@ -26,6 +26,8 @@ import org.elasticsearch.common.util.FeatureFlag;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.Streams;
+import org.elasticsearch.core.TieredPrefetchInput;
+import org.elasticsearch.core.TieredPrefetchInput.Outcome;
 import org.elasticsearch.index.store.PluggableDirectoryMetricsHolder;
 import org.elasticsearch.index.store.StoreMetrics;
 import org.elasticsearch.logging.LogManager;
@@ -39,6 +41,7 @@ import org.elasticsearch.xpack.stateless.lucene.StatelessAdviceHint;
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
 import java.nio.ByteBuffer;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongSupplier;
@@ -102,6 +105,8 @@ public class CacheFileReader {
     private final long exclusiveEnd;
     private final boolean hasSearchRole;
     private final boolean objectStorePrefetchEnabled;
+    // Bounds in-flight fetches started by ensureResident; tryPrefetch is deliberately not subject to it.
+    private final PrefetchBudget prefetchBudget;
     /**
      * Where to account the bytes read from the cache, whether they were already there or had to be fetched. Installed
      * by the index input that owns this reader, and carried on to its copies.
@@ -127,7 +132,8 @@ public class CacheFileReader {
             0,
             0,
             false,
-            objectStorePrefetchEnabled
+            objectStorePrefetchEnabled,
+            PrefetchBudget.UNLIMITED
         );
     }
 
@@ -155,11 +161,42 @@ public class CacheFileReader {
             blobCacheMetrics,
             relativeTimeInMillisSupplier,
             regionSize,
+            context,
+            hasSearchRole,
+            objectStorePrefetchEnabled,
+            PrefetchBudget.UNLIMITED
+        );
+    }
+
+    /**
+     * Same as the constructor above, with the node-wide {@link PrefetchBudget} that bounds fetches started by
+     * {@link #ensureResident}. This is the constructor the directory uses; the one without a budget exists for tests.
+     */
+    public CacheFileReader(
+        StatelessSharedBlobCacheService.CacheFile cacheFile,
+        CacheBlobReader cacheBlobReader,
+        BlobFileRanges blobFileRanges,
+        BlobCacheMetrics blobCacheMetrics,
+        LongSupplier relativeTimeInMillisSupplier,
+        int regionSize,
+        IOContext context,
+        boolean hasSearchRole,
+        boolean objectStorePrefetchEnabled,
+        PrefetchBudget prefetchBudget
+    ) {
+        this(
+            cacheFile,
+            cacheBlobReader,
+            blobFileRanges,
+            blobCacheMetrics,
+            relativeTimeInMillisSupplier,
+            regionSize,
             contextToAdvice(context, hasSearchRole),
             0,
             Long.MAX_VALUE,
             hasSearchRole,
-            objectStorePrefetchEnabled
+            objectStorePrefetchEnabled,
+            prefetchBudget
         );
     }
 
@@ -174,7 +211,8 @@ public class CacheFileReader {
         long exclusiveStart,
         long exclusiveEnd,
         boolean hasSearchRole,
-        boolean objectStorePrefetchEnabled
+        boolean objectStorePrefetchEnabled,
+        PrefetchBudget prefetchBudget
     ) {
         this.cacheFile = Objects.requireNonNull(cacheFile);
         this.cacheBlobReader = Objects.requireNonNull(cacheBlobReader);
@@ -187,6 +225,7 @@ public class CacheFileReader {
         this.exclusiveEnd = exclusiveEnd;
         this.hasSearchRole = hasSearchRole;
         this.objectStorePrefetchEnabled = objectStorePrefetchEnabled;
+        this.prefetchBudget = Objects.requireNonNull(prefetchBudget);
     }
 
     /**
@@ -213,7 +252,8 @@ public class CacheFileReader {
             exclusiveStart,
             exclusiveEnd,
             hasSearchRole,
-            objectStorePrefetchEnabled
+            objectStorePrefetchEnabled,
+            prefetchBudget
         );
         copy.storeMetrics = storeMetrics.singleThreaded();
         return copy;
@@ -252,7 +292,8 @@ public class CacheFileReader {
             exclStart,
             exclEnd,
             hasSearchRole,
-            objectStorePrefetchEnabled
+            objectStorePrefetchEnabled,
+            prefetchBudget
         );
         copy.storeMetrics = storeMetrics.singleThreaded();
         return copy;
@@ -346,6 +387,9 @@ public class CacheFileReader {
      * data already cached. Otherwise this method is best-effort and non-blocking, only succeeding
      * when the data is already present in the local cache.</p>
      *
+     * <p>This is the {@code IndexInput#prefetch} path. It reports nothing back and is not bounded by the
+     * {@link PrefetchBudget}; callers that want feedback or a bound use {@link #ensureResident}.</p>
+     *
      * @param offset the starting offset to prefetch from
      * @param length the number of bytes to prefetch
      * @return {@code true} if the fast-path prefetch succeeded,
@@ -356,24 +400,16 @@ public class CacheFileReader {
         if (objectStorePrefetchEnabled == false) {
             return cacheFile.tryPrefetch(offset, length);
         }
-        final long blobLength = cacheFile.getLength();
-        // return when there is nothing to prefetch
-        if (offset < 0 || offset >= blobLength || length <= 0) {
+        final ByteRange rangeToRead = clampToBlob(offset, length);
+        if (rangeToRead == null) {
+            // nothing to prefetch
             return false;
         }
-        final long remainingFileLength = blobLength - offset;
-        final long clampedLength = Math.min(length, remainingFileLength);
-        if (cacheFile.tryPrefetch(offset, clampedLength)) {
+        if (cacheFile.tryPrefetch(rangeToRead.start(), rangeToRead.length())) {
             blobCacheMetrics.recordPrefetch(PrefetchResult.AlreadyCached);
             return true;
         }
-        final int intLength = clampedLength < Integer.MAX_VALUE ? Math.toIntExact(clampedLength) : Integer.MAX_VALUE;
-        // same ranges cannot be passed to populate, as write range may extend beyond actually file length,
-        // however read range must stay within file length
-        final ByteRange rangeToRead = ByteRange.of(offset, offset + clampedLength);
-        populateForPrefetch(offset, intLength, remainingFileLength, rangeToRead, 0, ActionListener.wrap(v -> {
-            blobCacheMetrics.recordPrefetch(PrefetchResult.Fetched);
-        }, e -> {
+        populateForPrefetch(rangeToRead, 0, ActionListener.wrap(v -> { blobCacheMetrics.recordPrefetch(PrefetchResult.Fetched); }, e -> {
             blobCacheMetrics.recordPrefetch(PrefetchResult.Failed);
             logger.debug(() -> "async prefetch failed for [" + cacheFile.getCacheKey() + "]", e);
         }));
@@ -381,18 +417,160 @@ public class CacheFileReader {
     }
 
     /**
+     * The granularity at which this reader's cache tracks residency and fetches from the object store.
+     * See {@link TieredPrefetchInput#residencyRegionSize()}.
+     */
+    public final long residencyRegionSize() {
+        final int size = cacheFile.getRegionSize();
+        assert size > 0 : size;
+        return size;
+    }
+
+    /**
+     * Makes {@code [offset, offset + length)} resident without blocking and reports what happened, per
+     * {@link TieredPrefetchInput#ensureResident(long, long)}. Unlike {@link #tryPrefetch}, each region is evaluated on its
+     * own so that the {@link PrefetchBudget} is charged per region and a range spanning regions in different states
+     * reports the most expensive of them.
+     *
+     * <p>A range outside the blob, or with a non-positive length, is reported as {@link Outcome#SKIPPED}: there is nothing
+     * this reader can make resident. The index input validates against its own bounds before getting here.</p>
+     */
+    public final Outcome ensureResident(long offset, long length) throws IOException {
+        final ByteRange range = clampToBlob(offset, length);
+        if (range == null) {
+            return Outcome.SKIPPED;
+        }
+        final long regionSize = residencyRegionSize();
+        final int startRegion = regionOf(range.start(), regionSize);
+        final int endRegion = regionOf(range.end() - 1, regionSize);
+        Outcome worst = Outcome.RESIDENT;
+        for (int region = startRegion; region <= endRegion; region++) {
+            worst = worstOf(worst, ensureRegionResident(region, subRangeOfRegion(range, region, regionSize)));
+        }
+        return worst;
+    }
+
+    /**
+     * Bulk form of {@link #ensureResident(long, long)}, per {@link TieredPrefetchInput#ensureResident(long[], int, int, Outcome[])}.
+     * Groups the ranges by region first, so each region costs one cache lookup no matter how many ranges land in it, and
+     * each region's fetch is charged to the budget at most once. Within a region only the bytes actually requested are
+     * touched: the union of the ranges in it, not the whole region, so the {@code madvise} hint stays proportional to
+     * what the caller will read.
+     */
+    public final void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
+        if (TieredPrefetchInput.checkBulkArgs(offsets, length, count, outcomes)) {
+            return;
+        }
+        final long regionSize = residencyRegionSize();
+        // region -> {min start, max end} over all requested ranges that touch it
+        final Map<Integer, long[]> requestedByRegion = new HashMap<>();
+        for (int i = 0; i < count; i++) {
+            final ByteRange range = clampToBlob(offsets[i], length);
+            if (range == null) {
+                continue;
+            }
+            final int startRegion = regionOf(range.start(), regionSize);
+            final int endRegion = regionOf(range.end() - 1, regionSize);
+            for (int region = startRegion; region <= endRegion; region++) {
+                final ByteRange sub = subRangeOfRegion(range, region, regionSize);
+                final long[] bounds = requestedByRegion.computeIfAbsent(region, r -> new long[] { Long.MAX_VALUE, Long.MIN_VALUE });
+                bounds[0] = Math.min(bounds[0], sub.start());
+                bounds[1] = Math.max(bounds[1], sub.end());
+            }
+        }
+        final Map<Integer, Outcome> outcomeByRegion = new HashMap<>(requestedByRegion.size());
+        for (Map.Entry<Integer, long[]> entry : requestedByRegion.entrySet()) {
+            final long[] bounds = entry.getValue();
+            outcomeByRegion.put(entry.getKey(), ensureRegionResident(entry.getKey(), ByteRange.of(bounds[0], bounds[1])));
+        }
+        for (int i = 0; i < count; i++) {
+            final ByteRange range = clampToBlob(offsets[i], length);
+            if (range == null) {
+                outcomes[i] = Outcome.SKIPPED;
+                continue;
+            }
+            final int startRegion = regionOf(range.start(), regionSize);
+            final int endRegion = regionOf(range.end() - 1, regionSize);
+            Outcome worst = Outcome.RESIDENT;
+            for (int region = startRegion; region <= endRegion; region++) {
+                worst = worstOf(worst, outcomeByRegion.get(region));
+            }
+            outcomes[i] = worst;
+        }
+    }
+
+    /**
+     * Evaluates one region: resident on the fast path, otherwise admitted to the budget and fetched, joined if already in
+     * flight under the budget, or skipped. {@code range} must lie entirely within {@code region}.
+     */
+    private Outcome ensureRegionResident(int region, ByteRange range) throws IOException {
+        assert range.isEmpty() == false : range;
+        if (cacheFile.tryPrefetch(range.start(), range.length())) {
+            blobCacheMetrics.recordPrefetch(PrefetchResult.AlreadyCached);
+            return Outcome.RESIDENT;
+        }
+        if (objectStorePrefetchEnabled == false) {
+            return Outcome.SKIPPED;
+        }
+        final PrefetchBudget.RegionKey key = new PrefetchBudget.RegionKey(cacheFile.getCacheKey(), region);
+        return switch (prefetchBudget.tryAcquire(key)) {
+            case JOINED -> Outcome.FETCHING;
+            case DENIED -> Outcome.SKIPPED;
+            case ACQUIRED -> {
+                final ActionListener<Integer> listener = ActionListener.runAfter(ActionListener.wrap(v -> {
+                    blobCacheMetrics.recordPrefetch(PrefetchResult.Fetched);
+                }, e -> {
+                    blobCacheMetrics.recordPrefetch(PrefetchResult.Failed);
+                    logger.debug(() -> "ensureResident fetch failed for [" + cacheFile.getCacheKey() + "] region [" + region + "]", e);
+                }), () -> prefetchBudget.release(key));
+                try {
+                    populateForPrefetch(range, 0, listener);
+                } catch (Exception e) {
+                    // populate reports failures through the listener; a synchronous throw means nothing was dispatched
+                    listener.onFailure(e);
+                    yield Outcome.SKIPPED;
+                }
+                yield Outcome.FETCHING;
+            }
+        };
+    }
+
+    private static Outcome worstOf(Outcome a, Outcome b) {
+        return a.compareTo(b) >= 0 ? a : b;
+    }
+
+    private static int regionOf(long position, long regionSize) {
+        return Math.toIntExact(position / regionSize);
+    }
+
+    private static ByteRange subRangeOfRegion(ByteRange range, int region, long regionSize) {
+        final long regionStart = region * regionSize;
+        return ByteRange.of(Math.max(range.start(), regionStart), Math.min(range.end(), regionStart + regionSize));
+    }
+
+    /**
+     * Clamps a requested range to the blob, or returns {@code null} when nothing of it lies within the blob. The end may
+     * be clamped because callers such as {@code tryPrefetch} tolerate over-long requests; the start may not be negative.
+     */
+    private ByteRange clampToBlob(long offset, long length) {
+        final long blobLength = cacheFile.getLength();
+        if (offset < 0 || offset >= blobLength || length <= 0) {
+            return null;
+        }
+        return ByteRange.of(offset, offset + Math.min(length, blobLength - offset));
+    }
+
+    /**
      * Populates the cache for an async prefetch, but retries in case of {@link ResourceAlreadyUploadedException}.
      * Such a failure means the batched compound commit was uploaded to the object store while the fetch to the
      * indexing node was in flight
      */
-    private void populateForPrefetch(
-        long offset,
-        int intLength,
-        long remainingFileLength,
-        ByteRange rangeToRead,
-        int attempt,
-        ActionListener<Integer> listener
-    ) {
+    private void populateForPrefetch(ByteRange rangeToRead, int attempt, ActionListener<Integer> listener) {
+        final long offset = rangeToRead.start();
+        final long remainingFileLength = cacheFile.getLength() - offset;
+        // same ranges cannot be passed to populate, as write range may extend beyond actually file length,
+        // however read range must stay within file length
+        final int intLength = rangeToRead.length() < Integer.MAX_VALUE ? Math.toIntExact(rangeToRead.length()) : Integer.MAX_VALUE;
         final ByteRange rangeToWrite = cacheBlobReader.getRange(offset, intLength, remainingFileLength);
         cacheFile.populate(rangeToWrite, rangeToRead, (channel, channelPos, relativePos, len) -> {
             channel.prefetch(channelPos, len);
@@ -416,7 +594,7 @@ public class CacheFileReader {
                         () -> "prefetch for [" + cacheFile.getCacheKey() + "] already uploaded, retrying with attempt " + attempt,
                         e
                     );
-                    populateForPrefetch(offset, intLength, remainingFileLength, rangeToRead, attempt + 1, l);
+                    populateForPrefetch(rangeToRead, attempt + 1, l);
                 } else {
                     l.onFailure(e);
                 }

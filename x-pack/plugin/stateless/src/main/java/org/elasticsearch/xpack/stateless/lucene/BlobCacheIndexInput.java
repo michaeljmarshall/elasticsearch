@@ -21,6 +21,7 @@ import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.DirectAccessInput;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
+import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.index.store.PluggableDirectoryMetricsHolder;
 import org.elasticsearch.index.store.SelfAccountingIndexInput;
 import org.elasticsearch.index.store.StoreMetrics;
@@ -34,7 +35,11 @@ import java.nio.ByteBuffer;
 import java.nio.file.NoSuchFileException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public final class BlobCacheIndexInput extends BlobCacheBufferedIndexInput implements DirectAccessInput, SelfAccountingIndexInput {
+public final class BlobCacheIndexInput extends BlobCacheBufferedIndexInput
+    implements
+        DirectAccessInput,
+        SelfAccountingIndexInput,
+        TieredPrefetchInput {
 
     /**
      * Same as org.apache.lucene.store.IOContext#DEFAULT, except does not warn on missing files.
@@ -210,6 +215,44 @@ public final class BlobCacheIndexInput extends BlobCacheBufferedIndexInput imple
     @Override
     public void prefetch(long offset, long length) throws IOException {
         cacheFileReader.tryPrefetch(this.offset + offset, length);
+    }
+
+    @Override
+    public Outcome ensureResident(long offset, long length) throws IOException {
+        ensureWithinInput(offset, length);
+        return cacheFileReader.ensureResident(this.offset + offset, length);
+    }
+
+    @Override
+    public void ensureResident(long[] offsets, int length, int count, Outcome[] outcomes) throws IOException {
+        if (TieredPrefetchInput.checkBulkArgs(offsets, length, count, outcomes)) {
+            return;
+        }
+        // validate against this input's bounds before translating, so a bad offset is reported in the caller's terms
+        for (int i = 0; i < count; i++) {
+            ensureWithinInput(offsets[i], length);
+        }
+        long[] adjusted = offsets;
+        if (this.offset != 0) {
+            adjusted = new long[count];
+            for (int i = 0; i < count; i++) {
+                adjusted[i] = offsets[i] + this.offset;
+            }
+        }
+        cacheFileReader.ensureResident(adjusted, length, count, outcomes);
+    }
+
+    @Override
+    public long residencyRegionSize() {
+        return cacheFileReader.residencyRegionSize();
+    }
+
+    private void ensureWithinInput(long offset, long length) {
+        if (offset < 0 || length <= 0 || offset + length > length()) {
+            throw new IllegalArgumentException(
+                "range [" + offset + ", " + (offset + length) + ") is not within " + super.toString() + " of length " + length()
+            );
+        }
     }
 
     @Override

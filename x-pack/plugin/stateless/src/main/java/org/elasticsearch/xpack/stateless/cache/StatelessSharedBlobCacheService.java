@@ -38,6 +38,7 @@ import org.elasticsearch.xpack.stateless.StatelessPlugin;
 import org.elasticsearch.xpack.stateless.cache.reader.CacheBlobReader;
 import org.elasticsearch.xpack.stateless.cache.reader.CacheFileReader;
 import org.elasticsearch.xpack.stateless.cache.reader.LazyRangeMissingHandler;
+import org.elasticsearch.xpack.stateless.cache.reader.PrefetchBudget;
 import org.elasticsearch.xpack.stateless.cache.reader.SequentialRangeMissingHandler;
 import org.elasticsearch.xpack.stateless.lucene.BlobStoreCacheDirectoryMetrics;
 import org.elasticsearch.xpack.stateless.lucene.FileCacheKey;
@@ -193,6 +194,20 @@ public class StatelessSharedBlobCacheService extends SharedBlobCacheService<File
         Setting.Property.NodeScope
     );
 
+    /**
+     * Upper bound on the number of cache regions that {@link CacheFileReader#ensureResident} may have in flight from the
+     * object store at once, node-wide. Each admitted fetch fills one region, so this bounds both the memory held by
+     * in-flight fetches and the share of the shard-read pool that speculative prefetch can occupy. Requests beyond the
+     * bound are reported as skipped rather than queued, so a prefetching caller never blocks and learns to stop
+     * deepening its window. Plain {@code IndexInput#prefetch} is not subject to this bound.
+     */
+    public static final Setting<Integer> STATELESS_CACHE_OBJECT_STORE_PREFETCH_MAX_IN_FLIGHT_REGIONS_SETTING = Setting.intSetting(
+        "stateless.cache.object_store_prefetch.max_in_flight_regions",
+        32,
+        0,
+        Setting.Property.NodeScope
+    );
+
     // Stateless shared blob cache service populates-and-reads in-thread. And it relies on the cache service to fetch gap bytes
     // asynchronously using a CacheBlobReader.
     private static final Executor IO_EXECUTOR = EsExecutors.DIRECT_EXECUTOR_SERVICE;
@@ -201,6 +216,7 @@ public class StatelessSharedBlobCacheService extends SharedBlobCacheService<File
     private final PluggableDirectoryMetricsHolder<BlobStoreCacheDirectoryMetrics> metricsHolder;
     private final boolean hasSearchRole;
     private final boolean objectStorePrefetchEnabled;
+    private final PrefetchBudget prefetchBudget;
     private final boolean cacheBoostPreferenceEnabled;
     private volatile boolean metadataTimestampBackfillEnabled;
     private volatile boolean evictObsoleteRegionsEnabled;
@@ -250,6 +266,7 @@ public class StatelessSharedBlobCacheService extends SharedBlobCacheService<File
         this.metricsHolder = metricsHolder;
         this.hasSearchRole = DiscoveryNode.hasRole(settings, DiscoveryNodeRole.SEARCH_ROLE);
         this.objectStorePrefetchEnabled = STATELESS_CACHE_OBJECT_STORE_PREFETCH_ENABLED_SETTING.get(settings);
+        this.prefetchBudget = new PrefetchBudget(STATELESS_CACHE_OBJECT_STORE_PREFETCH_MAX_IN_FLIGHT_REGIONS_SETTING.get(settings));
         this.cacheBoostPreferenceEnabled = STATELESS_CACHE_BOOST_PREFERENCE_ENABLED_SETTING.get(settings);
         this.evictionDegradationThreshold = (int) (numRegions * STATELESS_CACHE_EVICTION_POLICY_DEGRADATION_THRESHOLD_SETTING.get(settings)
             .getAsRatio());
@@ -377,6 +394,11 @@ public class StatelessSharedBlobCacheService extends SharedBlobCacheService<File
 
     public boolean isObjectStorePrefetchEnabled() {
         return objectStorePrefetchEnabled;
+    }
+
+    /** The node-wide bound on in-flight {@link CacheFileReader#ensureResident} fetches. */
+    public PrefetchBudget getPrefetchBudget() {
+        return prefetchBudget;
     }
 
     public Executor getShardReadThreadPoolExecutor() {
