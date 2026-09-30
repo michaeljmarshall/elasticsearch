@@ -35,6 +35,8 @@ public final class QueryProfiler extends AbstractProfiler<QueryProfileBreakdown,
 
     private long vectorOpsCount;
 
+    private final TieredPrefetchOutcomeCounts tieredPrefetchOutcomes = new TieredPrefetchOutcomeCounts();
+
     public QueryProfiler() {
         super(new InternalQueryProfileTree());
     }
@@ -53,6 +55,24 @@ public final class QueryProfiler extends AbstractProfiler<QueryProfileBreakdown,
      */
     public long getVectorOpsCount() {
         return this.vectorOpsCount;
+    }
+
+    /**
+     * Adds the tiered prefetch outcomes observed by a query to the running totals.
+     * @param outcomes outcome counts to add to the profiler
+     */
+    public void addTieredPrefetchOutcomes(TieredPrefetchOutcomeCounts outcomes) {
+        this.tieredPrefetchOutcomes.add(outcomes);
+    }
+
+    /**
+     * Retrieves the tiered prefetch outcomes accumulated from the queries.
+     * TODO: these are in-memory only. Surfacing them in the profile output next to {@code vector_operations_count}
+     * requires new fields in {@link QueryProfileShardResult}, which means a transport version and XContent changes.
+     * @return tiered prefetch outcomes accumulated from the queries
+     */
+    public TieredPrefetchOutcomeCounts getTieredPrefetchOutcomes() {
+        return this.tieredPrefetchOutcomes;
     }
 
     /** Set the collector result that is associated with this profiler. */

@@ -87,7 +87,8 @@ public interface TieredPrefetchInput {
      * map outcomes back to its own records without knowing the region layout. Ranges that themselves span a region
      * boundary follow the rule in {@link #ensureResident(long, long)}.
      *
-     * @param offsets  file byte offsets for each range; only {@code [0, count)} are read
+     * @param offsets  byte offsets within this input for each range, as in {@link #ensureResident(long, long)};
+     *                 only {@code [0, count)} are read
      * @param length   byte length of each range (same for all); must be positive
      * @param count    number of ranges
      * @param outcomes output array; must have at least {@code count} entries, and only {@code [0, count)} are written

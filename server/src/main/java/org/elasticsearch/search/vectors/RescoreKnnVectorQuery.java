@@ -30,8 +30,11 @@ import org.apache.lucene.search.ScoreMode;
 import org.apache.lucene.search.TopDocs;
 import org.apache.lucene.search.VectorScorer;
 import org.apache.lucene.store.IndexInput;
+import org.apache.lucene.util.ArrayUtil;
 import org.elasticsearch.common.lucene.search.Queries;
+import org.elasticsearch.core.TieredPrefetchInput;
 import org.elasticsearch.search.profile.query.QueryProfiler;
+import org.elasticsearch.search.profile.query.TieredPrefetchOutcomeCounts;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -116,6 +119,11 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     protected final int k;
     protected final Query innerQuery;
     protected long vectorOperations = 0;
+    /**
+     * Outcomes of the tiered prefetch requests issued while rescoring. Replaced on each rewrite, like
+     * {@link #vectorOperations} is overwritten on each rewrite.
+     */
+    protected TieredPrefetchOutcomeCounts tieredPrefetchOutcomes = new TieredPrefetchOutcomeCounts();
 
     private RescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, int k, Query innerQuery) {
         this.fieldName = fieldName;
@@ -167,6 +175,14 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         return k;
     }
 
+    /**
+     * The {@link TieredPrefetchInput} outcomes observed by the last rewrite of this query. All counts are zero when the
+     * vector data is not backed by an input implementing {@link TieredPrefetchInput}.
+     */
+    public TieredPrefetchOutcomeCounts tieredPrefetchOutcomes() {
+        return tieredPrefetchOutcomes;
+    }
+
     @Override
     public void profile(QueryProfiler queryProfiler) {
         if (innerQuery instanceof QueryProfilerProvider queryProfilerProvider) {
@@ -174,6 +190,7 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         }
 
         queryProfiler.addVectorOpsCount(vectorOperations);
+        queryProfiler.addTieredPrefetchOutcomes(tieredPrefetchOutcomes);
     }
 
     @Override
@@ -220,7 +237,8 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
 
         @Override
         public Query rewrite(IndexSearcher searcher) throws IOException {
-            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, innerQuery);
+            tieredPrefetchOutcomes = new TieredPrefetchOutcomeCounts();
+            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, innerQuery, tieredPrefetchOutcomes);
             var topDocs = searcher.search(rescoreQuery, k);
             vectorOperations = topDocs.totalHits.value();
             return new KnnScoreDocQuery(topDocs.scoreDocs, searcher.getIndexReader());
@@ -256,7 +274,8 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
 
             // Retrieve top `k` documents from the top `rescoreK` query
             var topDocsQuery = new KnnScoreDocQuery(topDocs.scoreDocs, searcher.getIndexReader());
-            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, topDocsQuery);
+            tieredPrefetchOutcomes = new TieredPrefetchOutcomeCounts();
+            var rescoreQuery = new DirectRescoreKnnVectorQuery(fieldName, target, topDocsQuery, tieredPrefetchOutcomes);
             var rescoreTopDocs = searcher.search(rescoreQuery.rewrite(searcher), k);
             return new KnnScoreDocQuery(rescoreTopDocs.scoreDocs, searcher.getIndexReader());
         }
@@ -276,17 +295,23 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
     }
 
     private static class DirectRescoreKnnVectorQuery extends Query {
-        private static final int PREFETCH_BUFFER_SIZE = 100;
         private static final int BULK_SCORE_SIZE = 32;
 
         private final VectorQueryTarget target;
         private final String fieldName;
         private final Query innerQuery;
+        private final TieredPrefetchOutcomeCounts tieredPrefetchOutcomes;
 
-        DirectRescoreKnnVectorQuery(String fieldName, VectorQueryTarget target, Query innerQuery) {
+        DirectRescoreKnnVectorQuery(
+            String fieldName,
+            VectorQueryTarget target,
+            Query innerQuery,
+            TieredPrefetchOutcomeCounts tieredPrefetchOutcomes
+        ) {
             this.fieldName = fieldName;
             this.target = target;
             this.innerQuery = innerQuery;
+            this.tieredPrefetchOutcomes = tieredPrefetchOutcomes;
         }
 
         @Override
@@ -295,74 +320,20 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
         }
 
         /**
-         * A ring buffer that allows doc data to be prefetched, and then actually scored at a later point
-         * using a bulk scorer
+         * Iterates over the first {@code count} entries of a doc-ordered array of one leaf's candidate doc IDs.
+         * It starts positioned on the first candidate, so the bulk scorer can consume it without an initial
+         * {@code nextDoc()}; the vector scorer's own iterator is advanced to the same doc before the bulk scorer is created.
          */
-        private static class PrefetchRing {
+        static class CandidateIterator extends DocIdSetIterator {
+
             private final int[] docIds;
-            private final int[] docBases;
-            private final VectorScorer[] scorer;
+            private final int count;
+            private int idx = 0;    // just start on the first candidate without needing an initial advance
 
-            /*
-             * Only one bulk scorer can be created for a VectorScorer at once,
-             * so we need to re-use any created bulk scorer in subsequent batches
-             * for the same scorer. Might as well store them here.
-             */
-            private VectorScorer previousScorer;
-            private VectorScorer.Bulk previousBulkScorer;
-
-            private int head;
-            private int size;
-
-            PrefetchRing() {
-                this.docIds = new int[PREFETCH_BUFFER_SIZE];
-                this.docBases = new int[PREFETCH_BUFFER_SIZE];
-                this.scorer = new VectorScorer[PREFETCH_BUFFER_SIZE];
-            }
-
-            static int ringIdx(int head, int idx) {
-                return (head + idx) % PREFETCH_BUFFER_SIZE;
-            }
-
-            void advance(int count) {
-                int newHead = ringIdx(head, count);
-
-                // clear the scorers so the RingIterator doesn't pick up stale entries
-                // if iteration over a single leaf loops all the way round
-                if (newHead > head) {
-                    Arrays.fill(scorer, head, newHead, null);
-                } else {
-                    Arrays.fill(scorer, head, PREFETCH_BUFFER_SIZE, null);
-                    Arrays.fill(scorer, 0, newHead, null);
-                }
-
-                head = newHead;
-                size -= count;
-            }
-
-            void append(int doc, int docBase, VectorScorer vecScorer) {
-                int idx = ringIdx(head, size);
-                docIds[idx] = doc;
-                docBases[idx] = docBase;
-                scorer[idx] = vecScorer;
-                size++;
-            }
-        }
-
-        /**
-         * A lazy docID iterator over {@link PrefetchRing} for a specific scorer
-         */
-        static class RingIterator extends DocIdSetIterator {
-
-            private final PrefetchRing ring;
-            private final VectorScorer scorer;
-            private final int startIdx;
-            private int idx = 0;    // just start on startIdx without needing an initial advance
-
-            RingIterator(PrefetchRing ring, VectorScorer scorer, int startIdx) {
-                this.ring = ring;
-                this.scorer = scorer;
-                this.startIdx = startIdx;
+            CandidateIterator(int[] docIds, int count) {
+                assert count > 0;
+                this.docIds = docIds;
+                this.count = count;
             }
 
             @Override
@@ -370,13 +341,13 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
                 if (idx == NO_MORE_DOCS) {
                     return idx;
                 }
-                return ring.docIds[PrefetchRing.ringIdx(startIdx, idx)];
+                return docIds[idx];
             }
 
             @Override
             public int nextDoc() {
                 idx++;
-                if (ring.scorer[PrefetchRing.ringIdx(startIdx, idx)] != scorer) {
+                if (idx >= count) {
                     idx = NO_MORE_DOCS;
                 }
                 return docID();
@@ -389,10 +360,19 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
 
             @Override
             public long cost() {
-                return BULK_SCORE_SIZE;
+                return count;
             }
         }
 
+        /**
+         * Rescores leaf by leaf in two passes. The first pass materializes every candidate (doc, ord) of the leaf; the
+         * candidate set is bounded by {@code rescoreK}, so this is small. Materializing first lets us hand all of a
+         * leaf's candidate vectors to a {@link TieredPrefetchInput} in one bulk call, so a tiered store can start every
+         * remote fetch the leaf needs at once instead of discovering misses one blocking read at a time. Inputs that are
+         * not tiered get the plain {@link IndexInput#prefetch} hint per candidate, as before. The second pass scores the
+         * candidates in doc order with one forward-only bulk scorer per leaf. Outcomes never change which docs are
+         * scored or in what order; they are only counted.
+         */
         @Override
         public Query rewrite(IndexSearcher indexSearcher) throws IOException {
             Query innerRewritten = innerQuery.rewrite(indexSearcher);
@@ -404,7 +384,11 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             DocAndFloatFeatureBuffer buffer = new DocAndFloatFeatureBuffer();
             List<ScoreDoc> results = new ArrayList<>(10);
 
-            PrefetchRing ring = new PrefetchRing();
+            // candidate buffers, reused across leaves
+            int[] docs = new int[0];
+            int[] ords = new int[0];
+            long[] offsets = new long[0];
+            TieredPrefetchInput.Outcome[] outcomes = new TieredPrefetchInput.Outcome[0];
 
             for (var leaf : indexSearcher.getIndexReader().leaves()) {
                 var fieldInfo = leaf.reader().getFieldInfos().fieldInfo(fieldName);
@@ -434,34 +418,56 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
 
                 final int vectorByteSize = knnVectorValues.getVectorByteLength();
                 final IndexInput input = getIndexSliceOrNull(knnVectorValues);
+                // slices of a tiered input may be plain heap inputs, so check the slice itself rather than the file
+                final TieredPrefetchInput tieredInput = input instanceof TieredPrefetchInput t ? t : null;
                 KnnVectorValues.DocIndexIterator vectorIter = knnVectorValues.iterator();
                 DocIdSetIterator conjunction = ConjunctionUtils.intersectIterators(List.of(vectorIter, filterIterator));
-                VectorScorer vecScorer = switch (target) {
-                    case VectorQueryTarget.ByteTarget bt -> ((ByteVectorValues) knnVectorValues).rescorer(bt.vector());
-                    case VectorQueryTarget.FloatTarget ft -> ((FloatVectorValues) knnVectorValues).rescorer(ft.vector());
-                };
 
+                // pass 1: materialize the leaf's candidates in doc order
+                int count = 0;
                 int doc;
                 while ((doc = conjunction.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
                     assert doc == vectorIter.docID();
                     final int ord = vectorIter.index();
 
-                    if (input != null) {
+                    if (tieredInput == null && input != null) {
                         input.prefetch((long) ord * vectorByteSize, vectorByteSize);
                     }
 
-                    if (ring.size == PREFETCH_BUFFER_SIZE) {
-                        int scored = scoreEntries(ring, buffer, results);
-                        ring.advance(scored);
+                    if (count == docs.length) {
+                        docs = ArrayUtil.grow(docs, count + 1);
+                        ords = ArrayUtil.grow(ords, count + 1);
                     }
-
-                    ring.append(doc, leaf.docBase, vecScorer);
+                    docs[count] = doc;
+                    ords[count] = ord;
+                    count++;
                 }
-            }
+                if (count == 0) {
+                    continue;
+                }
 
-            while (ring.size > 0) {
-                int scored = scoreEntries(ring, buffer, results);
-                ring.advance(scored);
+                if (tieredInput != null) {
+                    if (offsets.length < count) {
+                        offsets = new long[ArrayUtil.oversize(count, Long.BYTES)];
+                        outcomes = new TieredPrefetchInput.Outcome[offsets.length];
+                    }
+                    for (int i = 0; i < count; i++) {
+                        offsets[i] = (long) ords[i] * vectorByteSize;
+                    }
+                    // one bulk call per leaf; the input groups the ranges by region internally
+                    tieredInput.ensureResident(offsets, vectorByteSize, count, outcomes);
+                    for (int i = 0; i < count; i++) {
+                        tieredPrefetchOutcomes.add(outcomes[i]);
+                    }
+                    // Reordering leaves or candidates by outcome (e.g. resident first) is deliberately deferred until measured.
+                }
+
+                // pass 2: score the candidates in doc order
+                VectorScorer vecScorer = switch (target) {
+                    case VectorQueryTarget.ByteTarget bt -> ((ByteVectorValues) knnVectorValues).rescorer(bt.vector());
+                    case VectorQueryTarget.FloatTarget ft -> ((FloatVectorValues) knnVectorValues).rescorer(ft.vector());
+                };
+                scoreLeaf(vecScorer, docs, count, leaf.docBase, buffer, results);
             }
 
             return new KnnScoreDocQuery(results.toArray(ScoreDoc[]::new), indexSearcher.getIndexReader());
@@ -471,46 +477,35 @@ public abstract class RescoreKnnVectorQuery extends Query implements QueryProfil
             return vectorValues instanceof HasIndexSlice h ? h.getSlice() : null;
         }
 
-        private static int scoreEntries(PrefetchRing ring, DocAndFloatFeatureBuffer buffer, List<ScoreDoc> results) throws IOException {
-            int docBase = ring.docBases[ring.head];
-            VectorScorer scorer = ring.scorer[ring.head];
+        /**
+         * Scores the first {@code count} doc-ordered candidates of one leaf in batches of {@link #BULK_SCORE_SIZE}.
+         * Only one bulk scorer can be created per {@link VectorScorer}, and it is forward-only, so a single bulk scorer
+         * covers the whole leaf and is advanced batch by batch.
+         */
+        private static void scoreLeaf(
+            VectorScorer scorer,
+            int[] docs,
+            int count,
+            int docBase,
+            DocAndFloatFeatureBuffer buffer,
+            List<ScoreDoc> results
+        ) throws IOException {
+            CandidateIterator iterator = new CandidateIterator(docs, count);
+            scorer.iterator().advance(docs[0]);
+            VectorScorer.Bulk bulkScorer = scorer.bulk(iterator);
 
-            // create the bulk scorer from this scorer if it's not created already
-            VectorScorer.Bulk bulkScorer;
-            if (ring.previousScorer == scorer) {
-                // re-use the bulk scorer from the previous batch
-                bulkScorer = ring.previousBulkScorer;
-            } else {
-                // first use of this scorer - create a new bulk scorer
-                RingIterator iterator = new RingIterator(ring, scorer, ring.head);
-                scorer.iterator().advance(ring.docIds[ring.head]);
-                bulkScorer = scorer.bulk(iterator);
+            for (int start = 0; start < count; start += BULK_SCORE_SIZE) {
+                int batchSize = Math.min(BULK_SCORE_SIZE, count - start);
+                int maxDocId = docs[start + batchSize - 1] + 1; // upTo is EXCLUSIVE
+                bulkScorer.nextDocsAndScores(maxDocId, null, buffer);
+                assert buffer.size == batchSize;
 
-                // and record it for any subsequent batches
-                ring.previousScorer = scorer;
-                ring.previousBulkScorer = bulkScorer;
-            }
-
-            // find up to BULK_SCORE_SIZE docs for this scorer to score
-            int count = 0;
-            for (; count < BULK_SCORE_SIZE && count < ring.size; count++) {
-                int idx = PrefetchRing.ringIdx(ring.head, count);
-                if (ring.scorer[idx] != scorer) break;    // scorer has changed - stop there
-            }
-            assert count > 0;
-
-            int maxDocId = ring.docIds[PrefetchRing.ringIdx(ring.head, count - 1)] + 1; // upTo is EXCLUSIVE
-            bulkScorer.nextDocsAndScores(maxDocId, null, buffer);
-            assert buffer.size == count;
-
-            for (int d = 0; d < buffer.size; d++) {
-                if (!Float.isNaN(buffer.features[d])) {
-                    results.add(new ScoreDoc(buffer.docs[d] + docBase, buffer.features[d]));
+                for (int d = 0; d < buffer.size; d++) {
+                    if (Float.isNaN(buffer.features[d]) == false) {
+                        results.add(new ScoreDoc(buffer.docs[d] + docBase, buffer.features[d]));
+                    }
                 }
             }
-
-            // return the number of docs scored
-            return count;
         }
 
         @Override
