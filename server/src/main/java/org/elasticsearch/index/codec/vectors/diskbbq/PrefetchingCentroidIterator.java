@@ -10,21 +10,62 @@
 package org.elasticsearch.index.codec.vectors.diskbbq;
 
 import org.apache.lucene.store.IndexInput;
+import org.elasticsearch.core.TieredPrefetchInput;
 
 import java.io.IOException;
 
 /**
  * A configurable iterator that prefetches posting lists ahead of consumption
  * to optimize disk I/O performance. This iterator wraps another CentroidIterator
- * and maintains a configurable buffer of prefetched posting list locations.
+ * and maintains a buffer of prefetched posting list locations.
+ *
+ * <p>When the posting list input is a plain {@link IndexInput}, the buffer has a fixed depth and each posting list is
+ * hinted with {@link IndexInput#prefetch}. That depth is tuned for local storage, where a miss costs a page-cache or
+ * disk read.
+ *
+ * <p>When the input implements {@link TieredPrefetchInput}, its bytes may live in a remote tier where a miss costs a
+ * round trip that is orders of magnitude more expensive, so a fixed shallow depth leaves the caller waiting on one
+ * remote fetch at a time. In that mode each posting list is requested with
+ * {@link TieredPrefetchInput#ensureResident(long, long)} instead, and the depth adapts to the outcomes:
+ * <ul>
+ *     <li>{@link TieredPrefetchInput.Outcome#FETCHING}: the window doubles, up to the maximum depth, so that more
+ *     remote fetches overlap with consumption.</li>
+ *     <li>{@link TieredPrefetchInput.Outcome#RESIDENT}: after {@link #RESIDENT_STREAK_TO_SHRINK} consecutive resident
+ *     outcomes the window halves, never below the initial depth, so a warm cache does not pull centroids from the
+ *     delegate far beyond what the caller will consume.</li>
+ *     <li>{@link TieredPrefetchInput.Outcome#SKIPPED}: the window stays as it is. The input will not schedule more
+ *     work, so looking further ahead would not start any more fetches.</li>
+ * </ul>
+ * Outcomes are only scheduling hints; the order and set of posting lists returned is identical in both modes.
  *
  * The iterator is not thread-safe and is designed for single-threaded access.
  */
 public final class PrefetchingCentroidIterator implements CentroidIterator {
 
+    /**
+     * Default upper bound on the adaptive window when the input is a {@link TieredPrefetchInput}. It bounds the ring
+     * allocation per iterator and how many posting lists beyond the caller's visit budget may be fetched in vain.
+     */
+    public static final int DEFAULT_MAX_PREFETCH_AHEAD = 16;
+
+    /**
+     * Number of consecutive {@link TieredPrefetchInput.Outcome#RESIDENT} outcomes after which the adaptive window is
+     * halved. Small enough to back off quickly once the cache is warm, large enough that a single resident posting
+     * list among remote ones does not collapse the window.
+     */
+    static final int RESIDENT_STREAK_TO_SHRINK = 4;
+
     private final CentroidIterator delegate;
     private final IndexInput postingListSlice;
-    private final int prefetchAhead;
+    /** Non-null when {@link #postingListSlice} reports residency outcomes; selects the adaptive path. */
+    private final TieredPrefetchInput tieredInput;
+    private final int initialPrefetchAhead;
+    private final int maxPrefetchAhead;
+
+    // Current target number of buffered posting lists; always within [initialPrefetchAhead, maxPrefetchAhead]
+    private int window;
+    // Consecutive RESIDENT outcomes since the last window change or non-resident outcome
+    private int residentStreak = 0;
 
     // Ring buffer for prefetched offsets and lengths
     private final PostingMetadata[] prefetchBuffer;
@@ -44,7 +85,9 @@ public final class PrefetchingCentroidIterator implements CentroidIterator {
     }
 
     /**
-     * Creates a prefetching iterator with configurable prefetch depth.
+     * Creates a prefetching iterator with configurable prefetch depth. On a {@link TieredPrefetchInput} the depth is
+     * the initial and minimum depth, and the window may grow to {@link #DEFAULT_MAX_PREFETCH_AHEAD} (or
+     * {@code prefetchAhead} if larger). Otherwise it is the fixed depth.
      *
      * @param delegate the underlying centroid iterator
      * @param postingListSlice the index input for posting lists
@@ -53,30 +96,85 @@ public final class PrefetchingCentroidIterator implements CentroidIterator {
      * @throws IllegalArgumentException if {@code prefetchAhead < 1}
      */
     public PrefetchingCentroidIterator(CentroidIterator delegate, IndexInput postingListSlice, int prefetchAhead) throws IOException {
+        this(delegate, postingListSlice, prefetchAhead, Math.max(prefetchAhead, DEFAULT_MAX_PREFETCH_AHEAD));
+    }
+
+    /**
+     * Creates a prefetching iterator with an explicit bound on the adaptive window.
+     *
+     * @param delegate the underlying centroid iterator
+     * @param postingListSlice the index input for posting lists
+     * @param prefetchAhead initial and minimum depth on a {@link TieredPrefetchInput}, fixed depth otherwise
+     *                      (must be &gt;= 1)
+     * @param maxPrefetchAhead maximum depth on a {@link TieredPrefetchInput}; ignored otherwise
+     *                         (must be &gt;= {@code prefetchAhead})
+     * @throws IOException if prefetching fails during initialization
+     * @throws IllegalArgumentException if {@code prefetchAhead < 1} or {@code maxPrefetchAhead < prefetchAhead}
+     */
+    public PrefetchingCentroidIterator(CentroidIterator delegate, IndexInput postingListSlice, int prefetchAhead, int maxPrefetchAhead)
+        throws IOException {
         if (prefetchAhead < 1) {
             throw new IllegalArgumentException("prefetchAhead must be at least 1, got: " + prefetchAhead);
         }
+        if (maxPrefetchAhead < prefetchAhead) {
+            throw new IllegalArgumentException(
+                "maxPrefetchAhead must be at least prefetchAhead [" + prefetchAhead + "], got: " + maxPrefetchAhead
+            );
+        }
         this.delegate = delegate;
         this.postingListSlice = postingListSlice;
-        this.prefetchAhead = prefetchAhead;
-        this.prefetchBuffer = new PostingMetadata[prefetchAhead];
-        // Initialize buffer by prefetching up to prefetchAhead elements
+        this.tieredInput = postingListSlice instanceof TieredPrefetchInput tiered ? tiered : null;
+        this.initialPrefetchAhead = prefetchAhead;
+        // The fallback path never grows, so it only needs a ring of the fixed depth.
+        this.maxPrefetchAhead = tieredInput != null ? maxPrefetchAhead : prefetchAhead;
+        this.window = prefetchAhead;
+        this.prefetchBuffer = new PostingMetadata[this.maxPrefetchAhead];
+        // Initialize buffer by prefetching up to the initial window
         fillBuffer();
     }
 
     /**
-     * Fills the prefetch buffer up to the configured capacity.
+     * Fills the prefetch buffer up to the current window. The window may grow while filling, in which case filling
+     * continues up to the new window.
      */
     private void fillBuffer() throws IOException {
-        while (bufferCount < prefetchAhead && delegate.hasNext()) {
+        while (bufferCount < window && delegate.hasNext()) {
             PostingMetadata offsetAndLength = delegate.nextPosting();
             prefetchBuffer[writeIndex] = offsetAndLength;
-            writeIndex = (writeIndex + 1) % prefetchAhead;
+            writeIndex = (writeIndex + 1) % prefetchBuffer.length;
             bufferCount++;
 
-            // Trigger prefetch
-            postingListSlice.prefetch(offsetAndLength.offset(), offsetAndLength.length());
+            requestPostingList(offsetAndLength);
         }
+    }
+
+    /**
+     * Hints the input about a posting list that just entered the buffer, adapting the window on the tiered path.
+     */
+    private void requestPostingList(PostingMetadata postingMetadata) throws IOException {
+        if (tieredInput == null) {
+            postingListSlice.prefetch(postingMetadata.offset(), postingMetadata.length());
+            return;
+        }
+        TieredPrefetchInput.Outcome outcome = tieredInput.ensureResident(postingMetadata.offset(), postingMetadata.length());
+        switch (outcome) {
+            case FETCHING -> {
+                residentStreak = 0;
+                window = Math.min(window * 2, maxPrefetchAhead);
+            }
+            case RESIDENT -> {
+                if (++residentStreak >= RESIDENT_STREAK_TO_SHRINK) {
+                    residentStreak = 0;
+                    window = Math.max(window / 2, initialPrefetchAhead);
+                }
+            }
+            case SKIPPED -> residentStreak = 0;
+        }
+    }
+
+    /** The current target number of buffered posting lists. Visible for testing. */
+    int window() {
+        return window;
     }
 
     @Override
@@ -92,19 +190,12 @@ public final class PrefetchingCentroidIterator implements CentroidIterator {
 
         // Get the next element from buffer
         PostingMetadata result = prefetchBuffer[readIndex];
-        readIndex = (readIndex + 1) % prefetchAhead;
+        prefetchBuffer[readIndex] = null;
+        readIndex = (readIndex + 1) % prefetchBuffer.length;
         bufferCount--;
 
-        // Try to fill buffer with one more element
-        if (delegate.hasNext()) {
-            PostingMetadata offsetAndLength = delegate.nextPosting();
-            prefetchBuffer[writeIndex] = offsetAndLength;
-            writeIndex = (writeIndex + 1) % prefetchAhead;
-            bufferCount++;
-
-            // Trigger prefetch for the newly added element
-            postingListSlice.prefetch(offsetAndLength.offset(), offsetAndLength.length());
-        }
+        // Refill the buffer to the current window
+        fillBuffer();
 
         return result;
     }
