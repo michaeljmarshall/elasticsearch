@@ -137,17 +137,21 @@ public class BlobCacheMetricsTests extends ESTestCase {
         int alreadyCached = between(0, 5);
         int asyncFetched = between(1, 5);
         int asyncFailed = between(0, asyncFetched);
+        int skipped = between(0, 5);
         IntStream.range(0, alreadyCached).forEach(i -> metrics.recordPrefetch(BlobCacheMetrics.PrefetchResult.AlreadyCached));
         IntStream.range(0, asyncFetched).forEach(i -> metrics.recordPrefetch(BlobCacheMetrics.PrefetchResult.Fetched));
         IntStream.range(0, asyncFailed).forEach(i -> metrics.recordPrefetch(BlobCacheMetrics.PrefetchResult.Failed));
+        IntStream.range(0, skipped).forEach(i -> metrics.recordPrefetch(BlobCacheMetrics.PrefetchResult.Skipped));
 
         long observedAlreadyCached = sumPrefetchMeasurementsFor(BlobCacheMetrics.PrefetchResult.AlreadyCached);
         long observedAsyncFetched = sumPrefetchMeasurementsFor(BlobCacheMetrics.PrefetchResult.Fetched);
         long observedAsyncFailed = sumPrefetchMeasurementsFor(BlobCacheMetrics.PrefetchResult.Failed);
+        long observedSkipped = sumPrefetchMeasurementsFor(BlobCacheMetrics.PrefetchResult.Skipped);
 
         assertEquals(alreadyCached, observedAlreadyCached);
         assertEquals(asyncFetched, observedAsyncFetched);
         assertEquals(asyncFailed, observedAsyncFailed);
+        assertEquals(skipped, observedSkipped);
 
         // Each call records exactly one measurement carrying the result attribute
         Measurement first = recordingMeterRegistry.getRecorder()

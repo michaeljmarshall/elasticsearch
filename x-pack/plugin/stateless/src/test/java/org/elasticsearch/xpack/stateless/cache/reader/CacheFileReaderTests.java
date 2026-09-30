@@ -600,7 +600,8 @@ public class CacheFileReaderTests extends ESTestCase {
      */
     public void testEnsureResidentSkippedWhenBudgetExhausted() throws Exception {
         Settings settings = nodeSettings();
-        BlobCacheMetrics metrics = new BlobCacheMetrics(new RecordingMeterRegistry(), NOOP_TIME_PROVIDER);
+        RecordingMeterRegistry meterRegistry = new RecordingMeterRegistry();
+        BlobCacheMetrics metrics = new BlobCacheMetrics(meterRegistry, NOOP_TIME_PROVIDER);
 
         try (
             NodeEnvironment env = new NodeEnvironment(settings, TestEnvironment.newEnvironment(settings));
@@ -626,6 +627,7 @@ public class CacheFileReaderTests extends ESTestCase {
             assertThat(budget.inFlightRegions(), equalTo(1));
             assertThat(cacheFileReader.ensureResident(BLOB_LENGTH, 1L), equalTo(Outcome.SKIPPED));
             assertBusy(() -> assertThat("a skipped region must not be fetched", fetchCount.get(), equalTo(1)));
+            assertPrefetchMetric(meterRegistry, BlobCacheMetrics.PrefetchResult.Skipped, 1);
 
             gate.countDown();
             assertBusy(() -> assertThat(budget.inFlightRegions(), equalTo(0)));
@@ -641,7 +643,8 @@ public class CacheFileReaderTests extends ESTestCase {
      */
     public void testEnsureResidentSkippedWhenObjectStorePrefetchDisabled() throws Exception {
         Settings settings = nodeSettings();
-        BlobCacheMetrics metrics = new BlobCacheMetrics(new RecordingMeterRegistry(), NOOP_TIME_PROVIDER);
+        RecordingMeterRegistry meterRegistry = new RecordingMeterRegistry();
+        BlobCacheMetrics metrics = new BlobCacheMetrics(meterRegistry, NOOP_TIME_PROVIDER);
 
         try (
             NodeEnvironment env = new NodeEnvironment(settings, TestEnvironment.newEnvironment(settings));
@@ -663,9 +666,11 @@ public class CacheFileReaderTests extends ESTestCase {
 
             assertThat(cacheFileReader.ensureResident(0L, blob.length), equalTo(Outcome.SKIPPED));
             assertThat(fetchCount.get(), equalTo(0));
+            assertPrefetchMetric(meterRegistry, BlobCacheMetrics.PrefetchResult.Skipped, 1);
 
             cacheFileReader.read(this, ByteBuffer.allocate(blob.length), 0, blob.length, blob.length, "test-plain");
             assertThat(cacheFileReader.ensureResident(0L, blob.length), equalTo(Outcome.RESIDENT));
+            assertPrefetchMetric(meterRegistry, BlobCacheMetrics.PrefetchResult.Skipped, 1);
         }
     }
 

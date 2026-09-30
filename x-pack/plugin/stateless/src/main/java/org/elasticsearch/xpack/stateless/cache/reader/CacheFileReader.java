@@ -510,12 +510,16 @@ public class CacheFileReader {
             return Outcome.RESIDENT;
         }
         if (objectStorePrefetchEnabled == false) {
+            blobCacheMetrics.recordPrefetch(PrefetchResult.Skipped);
             return Outcome.SKIPPED;
         }
         final PrefetchBudget.RegionKey key = new PrefetchBudget.RegionKey(cacheFile.getCacheKey(), region);
         return switch (prefetchBudget.tryAcquire(key)) {
             case JOINED -> Outcome.FETCHING;
-            case DENIED -> Outcome.SKIPPED;
+            case DENIED -> {
+                blobCacheMetrics.recordPrefetch(PrefetchResult.Skipped);
+                yield Outcome.SKIPPED;
+            }
             case ACQUIRED -> {
                 final ActionListener<Integer> listener = ActionListener.runAfter(ActionListener.wrap(v -> {
                     blobCacheMetrics.recordPrefetch(PrefetchResult.Fetched);

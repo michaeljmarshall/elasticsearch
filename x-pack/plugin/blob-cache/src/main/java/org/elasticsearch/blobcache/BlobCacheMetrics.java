@@ -159,13 +159,19 @@ public class BlobCacheMetrics {
     }
 
     /**
-     * The outcome of a {@code tryPrefetch} attempt, used as the {@code result} attribute on
+     * The outcome of a {@code tryPrefetch} or {@code ensureResident} attempt, used as the {@code result} attribute on
      * {@link #BLOB_CACHE_PREFETCH_TOTAL}.
      */
     public enum PrefetchResult {
         AlreadyCached,
         Fetched,
-        Failed
+        Failed,
+        /**
+         * The bytes were not cached and no fetch was scheduled, because the caller's prefetch budget was exhausted or
+         * object store prefetch is disabled. Only {@code ensureResident} reports this; {@code tryPrefetch} has no
+         * budget. The ratio of skipped to fetched is what to watch when tuning the budget.
+         */
+        Skipped
     }
 
     /// The scope of an LFU eviction scan
