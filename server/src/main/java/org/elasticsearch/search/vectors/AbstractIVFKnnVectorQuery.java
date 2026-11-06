@@ -41,6 +41,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.LongAccumulator;
+
+import static org.elasticsearch.search.vectors.AbstractMaxScoreKnnCollector.LEAST_COMPETITIVE;
 
 /**
  * Base class for IVF kNN vector queries. {@link #k} is the final result size (after any outer rescore) - callers
@@ -169,8 +172,8 @@ abstract class AbstractIVFKnnVectorQuery extends Query implements QueryProfilerP
         // When providedVisitRatio is 0.0f (dynamic), the codec computes the visit ratio
         // per-segment using the Two-Signal model with segment-size awareness.
         final float visitRatio = providedVisitRatio;
-        final SharedMinCompetitiveScore sharedScore = indexSearcher.getIndexReader().leaves().size() > 1
-            ? new SharedMinCompetitiveScore()
+        final LongAccumulator longAccumulator = indexSearcher.getIndexReader().leaves().size() > 1
+            ? new LongAccumulator(Long::max, LEAST_COMPETITIVE)
             : null;
 
         IvfSegmentConfig[] resolvedPerLeaf = new IvfSegmentConfig[leafReaderContexts.size()];
@@ -196,9 +199,9 @@ abstract class AbstractIVFKnnVectorQuery extends Query implements QueryProfilerP
             int leafBudget = IvfSegmentConfig.leafCollectorBudget(k, segmentOversample);
 
             // A leaf collecting fewer than mergeK candidates would publish a cutoff that prunes other leaves' candidates
-            // still inside the merge window, so it only reads the shared cutoff.
-            SharedMinCompetitiveScore leafSharedScore = sharedScore == null || leafBudget >= mergeK ? sharedScore : sharedScore.readOnly();
-            IVFCollectorManager knnCollectorManagerForSegment = getKnnCollectorManager(leafBudget, leafSharedScore);
+            // still inside the merge window, so disable score sharing for that leaf.
+            LongAccumulator leafAccumulator = leafBudget >= mergeK ? longAccumulator : null;
+            IVFCollectorManager knnCollectorManagerForSegment = getKnnCollectorManager(leafBudget, leafAccumulator);
 
             // Preconditioning might differ per segment when they are calibrated, so, potentially,
             // each carries its own preconditioner. The transform is therefore applied inside
@@ -407,8 +410,8 @@ abstract class AbstractIVFKnnVectorQuery extends Query implements QueryProfilerP
         return numCands;
     }
 
-    protected IVFCollectorManager getKnnCollectorManager(int k, SharedMinCompetitiveScore sharedScore) {
-        return new IVFCollectorManager(k, sharedScore);
+    protected IVFCollectorManager getKnnCollectorManager(int k, LongAccumulator longAccumulator) {
+        return new IVFCollectorManager(k, longAccumulator);
     }
 
     @Override
@@ -418,16 +421,11 @@ abstract class AbstractIVFKnnVectorQuery extends Query implements QueryProfilerP
 
     static class IVFCollectorManager implements KnnCollectorManager {
         private final int k;
-        private final SharedMinCompetitiveScore sharedScore;
+        final LongAccumulator longAccumulator;
 
-        IVFCollectorManager(int k, SharedMinCompetitiveScore sharedScore) {
+        IVFCollectorManager(int k, LongAccumulator longAccumulator) {
             this.k = k;
-            this.sharedScore = sharedScore;
-        }
-
-        /** Creates the search strategy for this leaf, wired to the cross-leaf shared score. */
-        IVFKnnSearchStrategy newSearchStrategy(float visitRatio, int numCands, int queryK) {
-            return new IVFKnnSearchStrategy(visitRatio, numCands, queryK, sharedScore);
+            this.longAccumulator = longAccumulator;
         }
 
         @Override

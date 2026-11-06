@@ -14,6 +14,7 @@ import org.apache.lucene.search.join.BitSetProducer;
 import org.elasticsearch.index.codec.vectors.diskbbq.IvfQueryConfigResolver;
 
 import java.util.Objects;
+import java.util.concurrent.atomic.LongAccumulator;
 
 public class DiversifyingChildrenIVFKnnByteVectorQuery extends IVFKnnByteVectorQuery {
 
@@ -60,8 +61,8 @@ public class DiversifyingChildrenIVFKnnByteVectorQuery extends IVFKnnByteVectorQ
     }
 
     @Override
-    protected IVFCollectorManager getKnnCollectorManager(int k, SharedMinCompetitiveScore sharedScore) {
-        return new DiversifiedIVFKnnCollectorManager(k, sharedScore, parentsFilter);
+    protected IVFCollectorManager getKnnCollectorManager(int k, LongAccumulator longAccumulator) {
+        return new DiversifiedIVFKnnCollectorManager(k, longAccumulator, parentsFilter);
     }
 
     @Override

@@ -28,9 +28,8 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.Random;
-import java.util.Set;
+import java.util.concurrent.atomic.LongAccumulator;
 
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
@@ -296,12 +295,11 @@ public class IVFKnnVectorQueryCalibratedMergeTests extends ESTestCase {
     }
 
     /**
-     * A leaf whose collector budget is below the shard merge budget must only read the shared cutoff: its own cutoff would
-     * let other leaves prune candidates that still belong in the merge window. Here a calibrated segment (oversample 1.25,
-     * budget 25) shares the shard with an uncalibrated one that falls back to the mapping oversample (10, budget 200), so the
-     * merge budget is 100.
+     * A leaf whose collector budget is below the shard merge budget must not share competitive scores. Here a calibrated
+     * segment (oversample 1.25, budget 25) shares the shard with an uncalibrated one that falls back to the mapping oversample
+     * (10, budget 200), so the merge budget is 100.
      */
-    public void testLeafBelowMergeBudgetDoesNotPublishSharedCutoff() throws IOException {
+    public void testLeafBelowMergeBudgetDoesNotShareCompetitiveScore() throws IOException {
         final int k = 10;
         final float mappingOversample = 10f;
         IvfSegmentConfig calibrated = IvfSegmentConfig.of(
@@ -339,20 +337,22 @@ public class IVFKnnVectorQueryCalibratedMergeTests extends ESTestCase {
                 new CollectorManagerCapturingQuery(queryVector, k, resolver, captured).rewrite(newSearcher(reader));
 
                 assertThat(IvfSegmentConfig.shardMergeBudget(k, mappingOversample), equalTo(100));
-                assertThat(
-                    Set.copyOf(captured.stream().map(args -> Map.entry(args.k(), args.sharedScore().canPublish())).toList()),
-                    equalTo(
-                        Set.of(
-                            Map.entry(IvfSegmentConfig.leafCollectorBudget(k, 1.25f), false),
-                            Map.entry(IvfSegmentConfig.leafCollectorBudget(k, mappingOversample), true)
-                        )
-                    )
-                );
+                assertThat(captured, hasSize(2));
+                CollectorManagerArgs calibratedArgs = captured.stream()
+                    .filter(args -> args.k() == IvfSegmentConfig.leafCollectorBudget(k, 1.25f))
+                    .findFirst()
+                    .orElseThrow();
+                CollectorManagerArgs uncalibratedArgs = captured.stream()
+                    .filter(args -> args.k() == IvfSegmentConfig.leafCollectorBudget(k, mappingOversample))
+                    .findFirst()
+                    .orElseThrow();
+                assertNull(calibratedArgs.longAccumulator());
+                assertNotNull(uncalibratedArgs.longAccumulator());
             }
         }
     }
 
-    private record CollectorManagerArgs(int k, SharedMinCompetitiveScore sharedScore) {}
+    private record CollectorManagerArgs(int k, LongAccumulator longAccumulator) {}
 
     /** Records the arguments {@code rewrite()} passes to each leaf's collector manager. */
     private static class CollectorManagerCapturingQuery extends IVFKnnFloatVectorQuery {
@@ -364,9 +364,9 @@ public class IVFKnnVectorQueryCalibratedMergeTests extends ESTestCase {
         }
 
         @Override
-        protected IVFCollectorManager getKnnCollectorManager(int k, SharedMinCompetitiveScore sharedScore) {
-            captured.add(new CollectorManagerArgs(k, sharedScore));
-            return super.getKnnCollectorManager(k, sharedScore);
+        protected IVFCollectorManager getKnnCollectorManager(int k, LongAccumulator longAccumulator) {
+            captured.add(new CollectorManagerArgs(k, longAccumulator));
+            return super.getKnnCollectorManager(k, longAccumulator);
         }
     }
 }

@@ -12,11 +12,13 @@ package org.elasticsearch.search.vectors;
 import org.elasticsearch.index.codec.vectors.cluster.NeighborQueue;
 import org.elasticsearch.test.ESTestCase;
 
+import java.util.concurrent.atomic.LongAccumulator;
+
 public class MaxScoreTopKnnCollectorTests extends ESTestCase {
 
     public void testMaxScorePropagation() {
-        SharedMinCompetitiveScore sharedScore = new SharedMinCompetitiveScore();
-        MaxScoreTopKnnCollector collector = new MaxScoreTopKnnCollector(2, 1000, new IVFKnnSearchStrategy(0.5f, 100, 10, sharedScore));
+        LongAccumulator accumulator = new LongAccumulator(Long::max, AbstractMaxScoreKnnCollector.LEAST_COMPETITIVE);
+        MaxScoreTopKnnCollector collector = new MaxScoreTopKnnCollector(2, 1000, new IVFKnnSearchStrategy(0.5f, 100, 10, accumulator));
         long competitiveScore = NeighborQueue.encodeRaw(1, 0.9f);
 
         collector.updateMinCompetitiveDocScore(competitiveScore);
@@ -43,8 +45,8 @@ public class MaxScoreTopKnnCollectorTests extends ESTestCase {
     }
 
     public void testUpdateMinCompetitiveDocScoreIgnoresPartialQueue() {
-        SharedMinCompetitiveScore sharedScore = new SharedMinCompetitiveScore();
-        MaxScoreTopKnnCollector collector = new MaxScoreTopKnnCollector(2, 1000, new IVFKnnSearchStrategy(0.5f, 100, 10, sharedScore));
+        LongAccumulator accumulator = new LongAccumulator(Long::max, AbstractMaxScoreKnnCollector.LEAST_COMPETITIVE);
+        MaxScoreTopKnnCollector collector = new MaxScoreTopKnnCollector(2, 1000, new IVFKnnSearchStrategy(0.5f, 100, 10, accumulator));
         collector.collect(2, 2.0f);
 
         long globalCompetitiveScore = NeighborQueue.encodeRaw(10, 0.2f);
